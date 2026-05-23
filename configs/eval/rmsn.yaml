@@ -1,0 +1,61 @@
+method: rmsn
+
+data:
+  wanted_domains: [cancer, hiv, warfarin, mimic]
+  raw_inputs:
+    pickle_dirs:
+      - outputs/data/cancer
+      - outputs/data/hiv
+      - outputs/data/warfarin
+      - outputs/data/mimic
+
+evaluation:
+  output_dir: outputs/eval/rmsn
+
+tuning:
+  initial_random_search: 40
+  top_k_reuse: 1
+
+baseline:
+  limits:
+    n_action_bits: 2
+    max_train_origins: 6000
+    max_val_origins: 256
+    prop_batch_size: 128
+    encoder_batch_size: 128
+    decoder_batch_size: 256
+
+  default_hparams:
+    hidden_units_encoder: 64
+    hidden_units_decoder: 64
+    num_layers: 1
+    dropout: 0.10
+    propensity_epochs: 30
+    encoder_epochs: 80
+    decoder_epochs: 100
+    lr_prop: 1.0e-3
+    lr_enc: 2.0e-3
+    lr_dec: 2.0e-3
+    batch_size_encoder: 128
+    batch_size_decoder: 256
+    weight_decay: 1.0e-5
+    optimizer_cls: adamw
+    max_grad_norm: 1.0
+    weight_clip_quantiles: [0.01, 0.99]
+
+  search_space:
+    num_layers: [1, 2]
+    dropout: [0.1, 0.2, 0.3, 0.4, 0.5]
+    lr_prop: [1.0e-2, 1.0e-3, 1.0e-4]
+    lr_enc: [1.0e-2, 1.0e-3, 1.0e-4]
+    lr_dec: [1.0e-2, 1.0e-3, 1.0e-4]
+    batch_size_encoder: [64, 128, 256]
+    batch_size_decoder: [256, 512, 1024]
+    max_grad_norm: [0.5, 1.0, 2.0, 4.0]
+
+  scaled_space:
+    width_multipliers: [0.5, 1.0, 2.0, 4.0]
+    min_width: 32
+    max_width: 160
+    width_multiple: 16
+    practical_widths: [32, 48, 64, 96, 128]

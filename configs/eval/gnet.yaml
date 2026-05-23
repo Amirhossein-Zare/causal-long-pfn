@@ -1,0 +1,46 @@
+method: gnet
+
+data:
+  wanted_domains: [cancer, hiv, warfarin, mimic]
+  raw_inputs:
+    pickle_dirs:
+      - outputs/data/cancer
+      - outputs/data/hiv
+      - outputs/data/warfarin
+      - outputs/data/mimic
+
+evaluation:
+  output_dir: outputs/eval/gnet
+
+tuning:
+  initial_random_search: 40
+  top_k_reuse: 1
+
+baseline:
+  limits:
+    max_val_origins: 256
+
+  default_hparams:
+    seq_hidden_units: 64
+    r_size: 64
+    fc_hidden_units: 64
+    dropout_rate: 0.10
+    num_layer: 1
+    epochs: 100
+    batch_size: 64
+    learning_rate: 1.0e-3
+    weight_decay: 1.0e-5
+    optimizer_cls: adamw
+    grad_clip: 1.0
+    vitals_loss_weight: 0.25
+    mc_samples: 1
+
+  search_space:
+    hidden_size: [48, 64, 96, 128]
+    r_size: [48, 64, 96]
+    num_layers: [1, 2]
+    dropout: [0.05, 0.10, 0.20]
+    lr: [1.0e-3, 3.0e-4]
+    batch_size: [32, 64]
+    epochs: [80, 120]
+    vitals_loss_weight: [0.15, 0.25, 0.35]

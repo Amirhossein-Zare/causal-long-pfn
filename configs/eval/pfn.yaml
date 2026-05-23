@@ -1,0 +1,25 @@
+method: pfn
+
+data:
+  wanted_domains: [cancer, hiv, warfarin, mimic]
+  raw_inputs:
+    pickle_dirs:
+      - outputs/data/cancer
+      - outputs/data/hiv
+      - outputs/data/warfarin
+      - outputs/data/mimic
+  ready_inputs:
+    ready_dirs:
+      - outputs/pfn_ready/all_domains
+
+ready_builder:
+  pfn_max_context: 500
+  max_test_rows_per_task: null
+  output_dir: outputs/pfn_ready/all_domains
+  seed: 2026
+
+evaluation:
+  output_dir: outputs/eval/causal_long_pfn
+  checkpoint_path: null
+  batch_size: 32
+  support_sigma_calibration: true

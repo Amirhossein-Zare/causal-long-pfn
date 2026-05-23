@@ -1,0 +1,51 @@
+cancer:
+  output_dir: outputs/data/cancer
+  gammas: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+  support_sizes: [40, 80, 160, 320, 500]
+  reps_per_cell: 2
+  test_base_patients: 1
+  seq_length: 60
+  window_size: 15
+  projection_horizon: 5
+  n_seq_random_trajectories: null
+  min_t_obs: 5
+  base_seed: 1000
+
+hiv:
+  output_dir: outputs/data/hiv
+  gammas: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+  support_sizes: [40, 80, 160, 320, 500]
+  reps_per_cell: 2
+  test_base_patients: 1
+  seq_length: 60
+  projection_horizon: 5
+  n_seq_random_trajectories: null
+  min_t_obs: 5
+  base_seed: 3000
+
+warfarin:
+  output_dir: outputs/data/warfarin
+  gammas: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+  support_sizes: [40, 80, 160, 320, 500]
+  reps_per_cell: 2
+  test_base_patients: 1
+  seq_length: 60
+  projection_horizon: 5
+  n_seq_random_trajectories: null
+  min_t_obs: 5
+  base_seed: 2000
+
+mimic:
+  input_root: data/raw
+  merged_dataset_slug: mimic-iii-extract-session2-merged
+  output_dir: outputs/data/mimic
+  gammas: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+  support_sizes: [40, 80, 160, 320, 500]
+  reps_per_cell: 2
+  test_base_patients: 1
+  seq_length: 60
+  projection_horizon: 5
+  total_seq_length: null
+  n_seq_random_trajectories: 1
+  min_t_obs: 5
+  base_seed: 4000

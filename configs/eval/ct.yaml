@@ -1,0 +1,54 @@
+method: ct
+
+data:
+  wanted_domains: [cancer, hiv, warfarin, mimic]
+  raw_inputs:
+    pickle_dirs:
+      - outputs/data/cancer
+      - outputs/data/hiv
+      - outputs/data/warfarin
+      - outputs/data/mimic
+
+evaluation:
+  output_dir: outputs/eval/ct
+
+tuning:
+  initial_random_search: 40
+  top_k_reuse: 1
+
+baseline:
+  limits:
+    max_val_origins: 256
+    eval_batch_size: 128
+
+  default_hparams:
+    ct_epochs: 80
+    batch_size: 64
+    lr: 1.0e-3
+    weight_decay: 1.0e-5
+    optimizer_cls: adamw
+    seq_hidden_units: 64
+    br_size: 64
+    fc_hidden_units: 64
+    num_layers: 2
+    num_heads: 4
+    dropout: 0.10
+    max_position_len: 65
+    grl_alpha: 0.10
+    treatment_loss_weight: 0.20
+    grad_clip: 1.0
+    augment_with_masked_vitals: false
+
+  search_space:
+    num_layers: [2, 3, 4]
+    num_heads: [2, 4]
+    seq_hidden_units: [64, 96, 128]
+    br_size: [64, 96, 128]
+    fc_hidden_units: [64, 96, 128]
+    dropout: [0.05, 0.10, 0.20]
+    lr: [1.0e-3, 3.0e-4, 1.0e-4]
+    weight_decay: [1.0e-5, 1.0e-4, 1.0e-3]
+    batch_size: [32, 64]
+    grad_clip: [0.5, 1.0]
+    treatment_loss_weight: [0.05, 0.10, 0.20]
+    augment_with_masked_vitals: [false]

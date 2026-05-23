@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "causal-long-pfn"
+version = "0.1.0"
+description = "CausalLongPFN benchmark generation, training, evaluation, baselines, aggregation, and calibration."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy",
+  "pandas",
+  "pyarrow",
+  "scipy",
+  "scikit-learn",
+  "matplotlib",
+  "PyYAML",
+  "tqdm",
+  "h5py",
+  "torch",
+]
+
+[project.scripts]
+clpfn-build-ready = "clpfn.cli.build_ready:main"
+clpfn-eval = "clpfn.cli.eval:main"
+clpfn-generate-all = "clpfn.cli.generate_all:main"
+clpfn-train = "clpfn.cli.train:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

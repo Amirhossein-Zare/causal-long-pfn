@@ -1,0 +1,36 @@
+method: msm
+
+data:
+  wanted_domains: [cancer, hiv, warfarin, mimic]
+  raw_inputs:
+    pickle_dirs:
+      - outputs/data/cancer
+      - outputs/data/hiv
+      - outputs/data/warfarin
+      - outputs/data/mimic
+
+evaluation:
+  output_dir: outputs/eval/msm
+
+tuning:
+  initial_random_search: 40
+  top_k_reuse: 1
+
+baseline:
+  limits:
+    n_action_bits: 2
+    max_val_origins: 512
+
+  default_hparams:
+    lag_features: 2
+    weight_clip_quantiles: [0.01, 0.99]
+    regressor: ridge
+    ridge_alpha: 1.0
+    max_logistic_iter: 500
+    logistic_C: 1.0e6
+    min_train_per_tau: 5
+
+  search_space:
+    lag_features: [2]
+    regressor: [linear, ridge]
+    ridge_alpha: [0.1, 1.0, 10.0]

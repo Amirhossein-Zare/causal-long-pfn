@@ -1,0 +1,60 @@
+method: crn
+
+data:
+  wanted_domains: [cancer, hiv, warfarin, mimic]
+  raw_inputs:
+    pickle_dirs:
+      - outputs/data/cancer
+      - outputs/data/hiv
+      - outputs/data/warfarin
+      - outputs/data/mimic
+
+evaluation:
+  output_dir: outputs/eval/crn
+
+tuning:
+  initial_random_search: 40
+  top_k_reuse: 1
+
+baseline:
+  limits:
+    max_train_origins: 6000
+    max_val_origins: 256
+
+  default_hparams:
+    encoder_epochs: 80
+    decoder_epochs: 100
+    batch_size_encoder: 128
+    batch_size_decoder: 256
+    lr_encoder: 1.0e-3
+    lr_decoder: 1.0e-3
+    weight_decay: 1.0e-5
+    optimizer_cls: adamw
+    hidden_units: 64
+    br_size: 64
+    fc_hidden_units: 64
+    num_layers: 1
+    dropout: 0.10
+    grl_alpha: 1.0
+    treatment_loss_weight: 1.0
+    grad_clip: 1.0
+
+  search_space:
+    num_layers: [1, 2]
+    hidden_units: [32, 48, 64, 96, 128]
+    br_size: [32, 48, 64, 96, 128]
+    fc_hidden_units: [32, 64, 96, 128, 192]
+    dropout: [0.1, 0.2, 0.3, 0.4, 0.5]
+    lr_encoder: [1.0e-2, 1.0e-3, 1.0e-4]
+    lr_decoder: [1.0e-2, 1.0e-3, 1.0e-4]
+    batch_size_encoder: [64, 128, 256]
+    batch_size_decoder: [256, 512, 1024]
+    grad_clip: [0.5, 1.0, 2.0]
+
+  scaled_space:
+    width_multipliers: [0.5, 1.0, 2.0, 4.0]
+    min_width: 32
+    max_width: 160
+    width_multiple: 16
+    practical_hidden: [32, 48, 64, 96, 128]
+    practical_fc_hidden: [32, 64, 96, 128, 192]

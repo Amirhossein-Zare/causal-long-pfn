@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Environments
+.env
+.venv/
+venv/
+
+# Runtime outputs / data
+/outputs/
+/checkpoints/
+/data/raw/
+/data/processed/
+/results/
+
+# Large experiment artifacts
+*.pt
+*.ckpt
+*.pth
+*.p
+*.pkl
+*.parquet
+*.paraquet
+*.pataquet
+*.pq
+*.zip
+*.csv
+!examples/**/*.csv
+!tests/fixtures/**
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/
