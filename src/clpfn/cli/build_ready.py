@@ -32,3 +32,7 @@ def main() -> None:
     print("\nReady build complete")
     print("Ready files:", len(result["ready_files"]))
     print("Output dir:", result["output_dir"])
+
+
+if __name__ == "__main__":
+    main()

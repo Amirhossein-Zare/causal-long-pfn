@@ -4,9 +4,7 @@ import torch
 from clpfn.config.defaults import (
     D_INPUT_MAX,
     D_STATIC_MAX,
-    MAX_INPUT_INDEX,
     MAX_SEQ_LEN,
-    MAX_TARGET_INDEX,
     N_SUPPORT_ANCHORS,
 )
 from clpfn.evaluation.core import benchmark as common
@@ -137,63 +135,6 @@ def collate_ready_batch(ready_map, task_name, start, end):
         "target_eval_norm": target_eval_norm,
         "oracle_Y": target_model_norm,
         "oracle_Y_final": target_model_norm,
-    })
-
-    return batch
-
-
-def collate_support_calibration_batch(ready_map, fit_idx, pair_rows):
-    support_context = ready_map["support_context"]
-
-    (
-        support_x_all,
-        support_actions_all,
-        support_anchor_y_all,
-        support_anchor_time_all,
-        support_static_all,
-        n_support_total,
-        d_input,
-    ) = support_context_arrays(support_context)
-
-    fit_idx = np.asarray(fit_idx, dtype=np.int64)
-    query_idx = np.asarray([pair[0] for pair in pair_rows], dtype=np.int64)
-    anchor_idx = np.asarray([pair[1] for pair in pair_rows], dtype=np.int64)
-
-    batch_size = int(len(pair_rows))
-    n_support = int(len(fit_idx))
-    input_scale = input_scale_for_d_input(d_input)
-    batch = init_pfn_batch_tensors(batch_size, n_support, d_input, input_scale)
-
-    batch["support_x"][:, :, :, :d_input] = torch.from_numpy(support_x_all[fit_idx]).float().unsqueeze(0) * input_scale
-    batch["support_actions"][:, :, :] = torch.from_numpy(support_actions_all[fit_idx]).long().unsqueeze(0)
-    batch["support_anchor_y"][:, :, :] = torch.from_numpy(support_anchor_y_all[fit_idx]).float().unsqueeze(0)
-    batch["support_anchor_time"][:, :, :] = torch.from_numpy(support_anchor_time_all[fit_idx]).long().unsqueeze(0)
-
-    batch["query_x"][:, :, :d_input] = torch.from_numpy(support_x_all[query_idx]).float() * input_scale
-    batch["query_actions"][:, :] = torch.from_numpy(support_actions_all[query_idx]).long()
-
-    label_time_np = np.clip(
-        support_anchor_time_all[query_idx, anchor_idx].astype(np.int64),
-        1,
-        MAX_TARGET_INDEX,
-    )
-    current_time_np = np.clip(label_time_np - 1, 0, MAX_INPUT_INDEX)
-    target_norm_np = support_anchor_y_all[query_idx, anchor_idx].astype(np.float32)
-
-    support_static_all = common.fixed_2d_float(support_static_all, rows=n_support_total, cols=D_STATIC_MAX)
-
-    batch["support_static"] = torch.from_numpy(support_static_all[fit_idx]).float().unsqueeze(0).expand(batch_size, -1, -1).clone()
-    batch["query_static"] = torch.from_numpy(support_static_all[query_idx]).float()
-
-    batch.update({
-        "current_time": torch.from_numpy(current_time_np).long(),
-        "current_t": torch.from_numpy(current_time_np).long(),
-        "t_obs": torch.from_numpy(current_time_np).long(),
-        "t_target": torch.from_numpy(label_time_np).long(),
-        "tau": torch.ones(batch_size, dtype=torch.long),
-        "target_y_norm": torch.from_numpy(target_norm_np).float(),
-        "oracle_Y": torch.from_numpy(target_norm_np).float(),
-        "oracle_Y_final": torch.from_numpy(target_norm_np).float(),
     })
 
     return batch

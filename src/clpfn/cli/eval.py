@@ -50,7 +50,7 @@ def _run_pfn(args: argparse.Namespace, cfg: dict[str, Any]):
         batch_size=pick(eval_cfg, "batch_size", 32),
         wanted_domains=tuple(domains),
         output_dir=args.output_dir if args.output_dir is not None else pick(eval_cfg, "output_dir", None),
-        support_sigma_calibration=bool(pick(eval_cfg, "support_sigma_calibration", True)),
+        report_calibration=bool(pick(eval_cfg, "report_calibration", True)),
     )
 
 
@@ -83,6 +83,8 @@ def _print_result_summary(result: dict[str, Any]) -> None:
     print("Summary CSV:", result.get("domain_task_summary_csv"))
     if result.get("calibration_summary_csv") is not None:
         print("Calibration CSV:", result["calibration_summary_csv"])
+    if result.get("calibration_rows_parquet") is not None:
+        print("Calibration rows Parquet:", result["calibration_rows_parquet"])
 
 
 def build_parser(*, default_method: str | None = None, default_config: str | None = None) -> argparse.ArgumentParser:
@@ -104,3 +106,7 @@ def main(*, default_method: str | None = None, default_config: str | None = None
     method, cfg = _load_eval_config(args)
     result = _run_pfn(args, cfg) if method == "pfn" else _run_baseline(method, args, cfg)
     _print_result_summary(result)
+
+
+if __name__ == "__main__":
+    main()

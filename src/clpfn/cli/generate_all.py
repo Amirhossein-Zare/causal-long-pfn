@@ -32,3 +32,7 @@ def main() -> None:
         generate_warfarin(WarfarinGeneratorConfig.from_dict(cfg.get("warfarin", {})))
     if "mimic" in wanted:
         generate_mimic(MIMICGeneratorConfig.from_dict(cfg.get("mimic", {})))
+
+
+if __name__ == "__main__":
+    main()

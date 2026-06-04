@@ -39,7 +39,7 @@ class HIVGeneratorConfig:
     seq_length: int = 60
     projection_horizon: int = 5
     n_seq_random_trajectories: int | None = None
-    min_t_obs: int = 5
+    min_t_obs: int = 10
 
     base_seed: int = 3000
 
@@ -132,6 +132,21 @@ def _ln_mult(rng: np.random.Generator, sigma: float) -> float:
 def state_to_features(raw_state: np.ndarray) -> np.ndarray:
     x = np.asarray(raw_state, dtype=np.float32)
     return np.log10(1.0 + x).astype(np.float32)
+
+def state_to_features(raw_state: np.ndarray) -> np.ndarray:
+    x = np.asarray(raw_state, dtype=np.float32)
+    return np.log10(1.0 + x).astype(np.float32)
+
+
+def profile_to_static_summary(profile: PatientProfile) -> dict[str, float]:
+
+    return {
+        "eff_rti_scale": float(profile.eff_rti_scale),
+        "eff_pi_scale": float(profile.eff_pi_scale),
+        "virus_threshold": float(np.log10(1.0 + profile.virus_threshold)),
+        "immune_threshold": float(np.log10(1.0 + profile.immune_threshold)),
+        "policy_aggr": float(profile.policy_aggr),
+    }
 
 
 def get_scaling_params(sim: dict[str, Any]) -> tuple[pd.Series, pd.Series]:
@@ -353,13 +368,8 @@ def simulate_factual_patient(rng: np.random.Generator, gamma: int, seq_length: i
         raw_state = integrate_one_bin(raw_state, profile, action)
         prev_action = action
 
-    profile_summary = {
-        "eff_rti_scale": profile.eff_rti_scale,
-        "eff_pi_scale": profile.eff_pi_scale,
-        "virus_threshold": profile.virus_threshold,
-        "immune_threshold": profile.immune_threshold,
-        "policy_aggr": profile.policy_aggr,
-    }
+    profile_summary = profile_to_static_summary(profile)
+    
     return {
         "profile": profile,
         "profile_summary": profile_summary,

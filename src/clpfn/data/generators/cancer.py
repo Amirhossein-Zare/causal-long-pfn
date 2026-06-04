@@ -51,7 +51,7 @@ class CancerGeneratorConfig:
     window_size: int = 15
     projection_horizon: int = 5
     n_seq_random_trajectories: int | None = None
-    min_t_obs: int = 5
+    min_t_obs: int = 10
 
     base_seed: int = 1000
 

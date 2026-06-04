@@ -8,7 +8,7 @@ cancer:
   window_size: 15
   projection_horizon: 5
   n_seq_random_trajectories: null
-  min_t_obs: 5
+  min_t_obs: 10
   base_seed: 1000
 
 hiv:
@@ -20,7 +20,7 @@ hiv:
   seq_length: 60
   projection_horizon: 5
   n_seq_random_trajectories: null
-  min_t_obs: 5
+  min_t_obs: 10
   base_seed: 3000
 
 warfarin:
@@ -32,7 +32,7 @@ warfarin:
   seq_length: 60
   projection_horizon: 5
   n_seq_random_trajectories: null
-  min_t_obs: 5
+  min_t_obs: 10
   base_seed: 2000
 
 mimic:
@@ -47,5 +47,5 @@ mimic:
   projection_horizon: 5
   total_seq_length: null
   n_seq_random_trajectories: 1
-  min_t_obs: 5
+  min_t_obs: 10
   base_seed: 4000

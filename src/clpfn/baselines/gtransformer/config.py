@@ -5,7 +5,7 @@ from clpfn.baselines.common.api import replace_mapping, require_baseline_config
 
 OUTPUT_DIR = Path("outputs/eval/gtransformer")
 
-GT_PROJECTION_HORIZON = 0
+GT_PROJECTION_HORIZON = 5
 MAX_VAL_ORIGINS = 0
 
 DEFAULT_HPARAMS = {}

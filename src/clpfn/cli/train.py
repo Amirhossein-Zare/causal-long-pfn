@@ -30,3 +30,7 @@ def main() -> None:
     from clpfn.training.train_pfn import train
 
     train()
+
+
+if __name__ == "__main__":
+    main()

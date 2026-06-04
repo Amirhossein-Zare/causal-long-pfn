@@ -39,7 +39,7 @@ class MIMICGeneratorConfig:
     projection_horizon: int = 5
     total_seq_length: int | None = None
     n_seq_random_trajectories: int = 1
-    min_t_obs: int = 5
+    min_t_obs: int = 10
     base_seed: int = 4000
 
     @classmethod
@@ -78,7 +78,7 @@ PROJECTION_HORIZON = 5
 TOTAL_SEQ_LENGTH = SEQ_LENGTH + PROJECTION_HORIZON
 N_SEQ_RANDOM_TRAJECTORIES = 1  # factual MIMIC has one observed trajectory, not random CF plans
 
-MIN_T_OBS = 5
+MIN_T_OBS = 10
 
 BASE_SEED = 4000
 D_STATE = 10
@@ -209,6 +209,20 @@ def choose_static_columns(static_ct: pd.DataFrame, max_cols: int = D_STATIC_MAX)
 def filter_min_tobs(raw, min_tobs=MIN_T_OBS):
     keep = np.where(np.asarray(raw["sequence_lengths"], dtype=np.int64) >= int(min_tobs))[0]
     return take_rows(raw, keep), keep
+
+
+def exclude_support_ids(eligible, support_patient_ids, label):
+    eligible = np.setdiff1d(
+        np.asarray(eligible, dtype=np.int64),
+        np.asarray(support_patient_ids, dtype=np.int64),
+        assume_unique=False,
+    )
+    if len(eligible) < TEST_BASE_PATIENTS:
+        raise RuntimeError(
+            f"Not enough disjoint MIMIC {label} stays after excluding support stays: "
+            f"need {TEST_BASE_PATIENTS}, have {len(eligible)}."
+        )
+    return eligible
 
 
 def get_scaling_params(sim):
@@ -610,8 +624,8 @@ def simulate_sequence_factual_rows(
 # Valid-data wrappers
 # ============================================================
 
-def make_valid_factual_test_data(rng, max_attempts=500):
-    eligible = MIMIC["support_eligible"]
+def make_valid_factual_test_data(rng, support_patient_ids, max_attempts=500):
+    eligible = exclude_support_ids(MIMIC["support_eligible"], support_patient_ids, "factual test")
 
     for attempt in range(max_attempts):
         ids = rng.choice(eligible, size=TEST_BASE_PATIENTS, replace=False)
@@ -624,8 +638,8 @@ def make_valid_factual_test_data(rng, max_attempts=500):
     raise RuntimeError("Could not generate non-empty MIMIC factual test data.")
 
 
-def make_valid_one_step_test_data(rng, max_attempts=500):
-    eligible = MIMIC["support_eligible"]
+def make_valid_one_step_test_data(rng, support_patient_ids, max_attempts=500):
+    eligible = exclude_support_ids(MIMIC["support_eligible"], support_patient_ids, "one-step test")
 
     for attempt in range(max_attempts):
         ids = rng.choice(eligible, size=TEST_BASE_PATIENTS, replace=False)
@@ -640,8 +654,8 @@ def make_valid_one_step_test_data(rng, max_attempts=500):
     raise RuntimeError("Could not generate non-empty MIMIC one-step test_data.")
 
 
-def make_valid_seq_test_data(rng, max_attempts=500):
-    eligible = MIMIC["seq_eligible"]
+def make_valid_seq_test_data(rng, support_patient_ids, max_attempts=500):
+    eligible = exclude_support_ids(MIMIC["seq_eligible"], support_patient_ids, "sequence test")
 
     for attempt in range(max_attempts):
         ids = rng.choice(eligible, size=TEST_BASE_PATIENTS, replace=False)
@@ -680,10 +694,20 @@ def make_dataset(dataset_id, gamma, support_size, rep, seed):
         rng=rng,
         support_size=support_size,
     )
+    support_patient_ids = support_data["patient_ids"]
 
-    test_data_factuals, factual_attempts = make_valid_factual_test_data(rng=rng)
-    test_data, one_step_attempts = make_valid_one_step_test_data(rng=rng)
-    test_data_seq, seq_attempts = make_valid_seq_test_data(rng=rng)
+    test_data_factuals, factual_attempts = make_valid_factual_test_data(
+        rng=rng,
+        support_patient_ids=support_patient_ids,
+    )
+    test_data, one_step_attempts = make_valid_one_step_test_data(
+        rng=rng,
+        support_patient_ids=support_patient_ids,
+    )
+    test_data_seq, seq_attempts = make_valid_seq_test_data(
+        rng=rng,
+        support_patient_ids=support_patient_ids,
+    )
 
     scaling_data = get_scaling_params(support_data)
 

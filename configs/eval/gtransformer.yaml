@@ -19,7 +19,7 @@ tuning:
 baseline:
   limits:
     max_val_origins: 256
-    projection_horizon: 0
+    projection_horizon: 5
 
   default_hparams:
     epochs: 80

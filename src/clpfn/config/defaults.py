@@ -15,7 +15,7 @@ def default_training_config_path() -> Path:
     return project_root() / "configs" / "train" / "causal_long_pfn.yaml"
 
 
-OBS_TIME_MIN = 3
+OBS_TIME_MIN = 1
 OBS_TIME_MAX = 60
 HORIZON_MIN = 1
 HORIZON_MAX = 5

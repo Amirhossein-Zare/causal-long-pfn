@@ -22,6 +22,11 @@ from clpfn.config.defaults import (
 )
 
 
+STATIC_COVARIATE_EPISODE_PROB = 0.30
+STATIC_CONTINUOUS_NOISE = 0.35
+STATIC_CATEGORY_TEMPERATURE = 1.0
+
+
 class TSCMEpisodeGenerator:
     """
     Synthetic episode generator for the CausalLongPFN TSCM prior.
@@ -815,6 +820,63 @@ class TSCMEpisodeGenerator:
 
         return np.clip(anchor_times, 1, MAX_SEQ_LEN).astype(np.int32)
 
+    def _sample_observed_static_from_latent(
+        self,
+        latent: np.ndarray,
+        enabled: bool,
+    ) -> np.ndarray:
+        """
+        Generate observed static covariates from latent unit factors.
+
+        Layout for D_STATIC_MAX=5:
+            0: continuous latent proxy
+            1: binary latent proxy
+            2: complementary binary latent proxy
+            3: categorical latent proxy indicator 1
+            4: categorical latent proxy indicator 2
+        """
+        n_units = int(latent.shape[0])
+        static = np.zeros((n_units, D_STATIC_MAX), dtype=np.float32)
+
+        if not enabled:
+            return static
+
+        continuous_proxy = 0.8 * latent[:, 0] + STATIC_CONTINUOUS_NOISE * self.rng.standard_normal(n_units)
+        continuous_scale = float(np.sqrt(0.8 ** 2 + STATIC_CONTINUOUS_NOISE ** 2))
+        continuous_proxy = continuous_proxy / max(continuous_scale, 0.1)
+        static[:, 0] = np.clip(continuous_proxy, -3.0, 3.0).astype(np.float32)
+
+        if D_STATIC_MAX >= 3:
+            binary_logit = 0.9 * latent[:, 1] + 0.25 * self.rng.standard_normal(n_units)
+            binary_proxy = (binary_logit > 0.0).astype(np.float32)
+            static[:, 1] = binary_proxy
+            static[:, 2] = 1.0 - binary_proxy
+
+        if D_STATIC_MAX >= 5:
+            logits = np.stack(
+                [
+                    0.7 * latent[:, 2],
+                    -0.4 * latent[:, 0] + 0.4 * latent[:, 1],
+                    -0.3 * latent[:, 2] + 0.2 * self.rng.standard_normal(n_units),
+                ],
+                axis=1,
+            ).astype(np.float32)
+
+            logits = logits / STATIC_CATEGORY_TEMPERATURE
+            logits = logits - logits.max(axis=1, keepdims=True)
+            probs = np.exp(logits)
+            probs = probs / probs.sum(axis=1, keepdims=True)
+
+            draws = np.array(
+                [self.rng.choice(3, p=probs[i]) for i in range(n_units)],
+                dtype=np.int32,
+            )
+
+            static[:, 3] = (draws == 0).astype(np.float32)
+            static[:, 4] = (draws == 1).astype(np.float32)
+
+        return static.astype(np.float32)
+
     def sample_episode(self) -> dict:
         while True:
             tscm = self.sample_tscm()
@@ -831,6 +893,7 @@ class TSCMEpisodeGenerator:
 
             is_observational_query = bool(self.rng.random() < OBSERVATIONAL_QUERY_PROB)
             mask_future_support_covariates = bool(self.rng.random() < SUPPORT_FUTURE_COVARIATE_MASK_PROB)
+            use_observed_static = bool(self.rng.random() < STATIC_COVARIATE_EPISODE_PROB)
 
             planned_actions = np.zeros(MAX_SEQ_LEN, dtype=np.int32)
 
@@ -858,6 +921,10 @@ class TSCMEpisodeGenerator:
                 }
 
             support_latent = self.rng.standard_normal((n_support, LATENT_UNIT_DIM)).astype(np.float32)
+            support_static = self._sample_observed_static_from_latent(
+                support_latent,
+                enabled=use_observed_static,
+            )
             support_policy_weights_bit0 = (
                 tscm["policy_state_weights_bit0"] + support_latent @ tscm["latent_policy_loading_bit0"].T
             )
@@ -930,6 +997,10 @@ class TSCMEpisodeGenerator:
                 continue
 
             query_latent = self.rng.standard_normal(LATENT_UNIT_DIM).astype(np.float32)
+            query_static = self._sample_observed_static_from_latent(
+                query_latent.reshape(1, -1),
+                enabled=use_observed_static,
+            )[0]
 
             query_policy_weights_bit0 = (
                 tscm["policy_state_weights_bit0"] + tscm["latent_policy_loading_bit0"] @ query_latent
@@ -1220,6 +1291,6 @@ class TSCMEpisodeGenerator:
 
                 "target_y_norm": target_y_norm,
 
-                "support_static": np.zeros((n_support, D_STATIC_MAX), dtype=np.float32),
-                "query_static": np.zeros(D_STATIC_MAX, dtype=np.float32),
+                "support_static": support_static.astype(np.float32),
+                "query_static": query_static.astype(np.float32),
             }

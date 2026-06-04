@@ -30,7 +30,7 @@ training:
   SEED: 42
 
 prior:
-  OBS_TIME_MIN: 3
+  OBS_TIME_MIN: 1
   OBS_TIME_MAX: 60
   HORIZON_MIN: 1
   HORIZON_MAX: 5

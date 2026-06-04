@@ -22,4 +22,4 @@ evaluation:
   output_dir: outputs/eval/causal_long_pfn
   checkpoint_path: null
   batch_size: 32
-  support_sigma_calibration: true
+  report_calibration: true
