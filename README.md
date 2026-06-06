@@ -261,23 +261,6 @@ MIMIC-III is not redistributed with this repository. To run the MIMIC-III
 benchmark, obtain credentialed access through the official PhysioNet data-use
 process and prepare a MIMIC-Extract-style `all_hourly_data.h5` file.
 
-The generator searches under `data/raw` for a path containing the configured
-slug:
-
-```yaml
-mimic:
-  input_root: data/raw
-  merged_dataset_slug: mimic-iii-extract-session2-merged
-```
-
-A typical local layout is:
-
-```text
-data/raw/mimic-iii-extract-session2-merged/all_hourly_data.h5
-```
-
-The `data/raw/` directory is ignored by Git.
-
 ## Configuration
 
 Most behavior is controlled through YAML files:
