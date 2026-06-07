@@ -8,13 +8,18 @@
 **CausalLongPFN** is the reference implementation for *Causal Longitudinal
 Prior-Fitted Networks for Counterfactual Outcome Prediction*.
 
-The project studies **time-series causal inference** and **longitudinal causal
-prediction** from treatment-response trajectories. A CausalLongPFN model is
-pretrained on synthetic temporal structural causal models (TSCMs), then used as
-a frozen **zero-shot in-context predictor** on new domains. Given support
-trajectories, a query history, and a planned future treatment sequence, the model
-predicts a distribution over future outcomes without target-domain gradient
-updates, propensity-model fitting, or adversarial balancing.
+We introduce **Causal Longitudinal Prior-Fitted Networks
+(CausalLongPFN)**, a prior-fitted network for **time-series causal inference in
+longitudinal treatment-response data** and **zero-shot in-context
+counterfactual outcome prediction**. The project studies history-conditional
+potential-outcome prediction from longitudinal treatment-response time series:
+given support trajectories from a new domain, a query history, and a planned
+future treatment sequence, a frozen CausalLongPFN model predicts a distribution
+over future outcomes without target-domain gradient updates, propensity-model
+fitting, or adversarial balancing. The model is pretrained on synthetic temporal
+structural causal models (TSCMs) and evaluated on branchable cancer, HIV, and
+warfarin counterfactual benchmarks, as well as factual MIMIC-III ICU
+rolling-origin prediction.
 
 ## Paper
 
@@ -43,18 +48,17 @@ Amirhossein Zare, Amirhessam Zare, Herlock Rahimi, Reza Salarikia, Mohammad Kash
 
 This repository contains code for:
 
-- synthetic CausalLongPFN pretraining from a temporal SCM prior;
-- benchmark generation for cancer, HIV, warfarin, and MIMIC-III-style ICU tasks;
+- synthetic CausalLongPFN pretraining from a temporal structural causal model
+  prior;
+- benchmark generation for cancer, HIV, warfarin, and MIMIC-III-style ICU
+  treatment-response tasks;
 - conversion of benchmark files into CausalLongPFN-ready support/query datasets;
-- checkpoint evaluation for the frozen CausalLongPFN model;
+- zero-shot in-context evaluation of the frozen CausalLongPFN model;
 - baseline evaluation for MSM, RMSN, G-Net, CRN, Causal Transformer, and
   G-Transformer;
 - normalized RMSE summaries, row-level prediction outputs, and one-step
-  calibration diagnostics.
+  probabilistic calibration diagnostics.
 
-The repository does **not** include raw MIMIC-III data, generated benchmark
-pickles, PFN-ready files, or large evaluation outputs. Pretrained weights are
-hosted on Hugging Face: <https://huggingface.co/Amirhossein-Zare/causal-long-pfn>.
 
 ## Repository layout
 
@@ -245,9 +249,9 @@ only as in-context input.
 
 | Domain | Evaluation type | Notes |
 | --- | --- | --- |
-| Cancer | Branchable counterfactual | Tumor-growth treatment-response benchmark. |
-| HIV | Branchable counterfactual | Treatment-dynamics benchmark with alternative future actions. |
-| Warfarin | Branchable counterfactual | PK/PD-style treatment-response benchmark. |
+| Cancer | Branchable counterfactual | Tumor-growth treatment-response benchmark with alternative future actions. |
+| HIV | Branchable counterfactual | Treatment-dynamics benchmark with alternative future regimens. |
+| Warfarin | Branchable counterfactual | PK/PD-style treatment-response benchmark with alternative dose sequences. |
 | MIMIC-III | Factual rolling-origin prediction | Real ICU trajectories evaluated only under observed future treatments. |
 
 The simulated and semi-mechanistic domains provide counterfactual labels by
@@ -283,24 +287,32 @@ and horizon `5`.
 In the paper, a single frozen CausalLongPFN model is compared with baselines that
 are trained and selected separately for each target domain. The reported model
 achieves the best domain-balanced one-step normalized RMSE and the third-best
-domain-balanced five-step normalized RMSE, and ranks first on factual MIMIC-III
-rolling-origin prediction at both horizons.
+domain-balanced five-step normalized RMSE. It also ranks first on factual
+MIMIC-III rolling-origin prediction at both horizons, where evaluation is under
+observed future treatment paths rather than unobserved counterfactual
+interventions.
 
 For exact numbers and experimental details, see the paper.
 
 ## Causal scope and limitations
 
-CausalLongPFN is a research tool for causal sequence modeling, time-series causal
-inference, and longitudinal counterfactual outcome prediction. It does not remove
-the assumptions required for causal interpretation of observational data.
+CausalLongPFN is a research tool for time-series causal inference in
+longitudinal treatment-response data, causal sequence modeling, and
+history-conditional counterfactual outcome prediction. It does not remove the
+assumptions required for causal interpretation of observational data.
 Counterfactual interpretation still requires, among other conditions,
-consistency, positivity, and sequential exchangeability given the measured
-history.
+consistency, positivity, sequential exchangeability given the measured history,
+adequate treatment overlap, and well-defined interventions.
 
-Performance also depends on support from the synthetic prior. Predictions may be
-unreliable when the target domain contains mechanisms, missingness patterns,
-treatment policies, or intervention effects that are poorly represented by the
-pretraining prior. The current implementation focuses on discrete treatments,
-fixed time grids, and deterministic mean rollout.
+Performance also depends on support from the synthetic TSCM prior.
+Predictions may be unreliable when the target domain contains mechanisms,
+missingness patterns, treatment policies, outcome dynamics, or intervention
+effects that are poorly represented by the pretraining prior. The current
+implementation focuses on discrete treatments, fixed time grids, and
+deterministic mean rollout.
+
+MIMIC-III results should be interpreted as factual rolling-origin prediction
+under observed clinical practice, not as validation of individual counterfactual
+treatment effects under unobserved ICU interventions.
 
 This repository is not intended for clinical decision-making.
