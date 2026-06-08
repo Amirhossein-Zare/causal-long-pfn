@@ -1,9 +1,9 @@
 # CausalLongPFN
 
 [![arXiv](https://img.shields.io/badge/arXiv-2606.05797-b31b1b.svg)](https://arxiv.org/abs/2606.05797)
-[![arXiv DOI](https://img.shields.io/badge/DOI-10.48550%2FarXiv.2606.05797-blue.svg)](https://doi.org/10.48550/arXiv.2606.05797)
+[![DOI](https://img.shields.io/badge/DOI-10.48550%2FarXiv.2606.05797-blue.svg)](https://doi.org/10.48550/arXiv.2606.05797)
 [![Hugging Face](https://img.shields.io/badge/Hugging%20Face-Model-yellow.svg)](https://huggingface.co/Amirhossein-Zare/causal-long-pfn)
-[![Zenodo DOI](https://zenodo.org/badge/1247364520.svg)](https://doi.org/10.5281/zenodo.20588199)
+[![Zenodo](https://img.shields.io/badge/Zenodo-10.5281%2Fzenodo.20588199-blue.svg)](https://doi.org/10.5281/zenodo.20588199)
 [![Python](https://img.shields.io/badge/python-%3E%3D3.10-blue.svg)](https://www.python.org/)
 
 **CausalLongPFN** is the reference implementation for *Causal Longitudinal
