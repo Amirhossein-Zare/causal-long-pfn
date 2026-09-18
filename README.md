@@ -55,8 +55,8 @@ This repository contains code for:
   treatment-response tasks;
 - conversion of benchmark files into CausalLongPFN-ready support/query datasets;
 - zero-shot in-context evaluation of the frozen CausalLongPFN model;
-- baseline evaluation for MSM, RMSN, G-Net, CRN, Causal Transformer, and
-  G-Transformer;
+- baseline evaluation for MSM, RMSN, G-Net, and Causal Transformer, plus
+  persistence and linear-autoregressive reference baselines;
 - normalized RMSE summaries, row-level prediction outputs, and one-step
   probabilistic calibration diagnostics.
 
@@ -67,6 +67,7 @@ This repository contains code for:
 configs/
   data/                     Benchmark-generation configs
   train/                    CausalLongPFN synthetic-pretraining configs
+  train/ablations/          Seven pretraining-ablation configs
   eval/                     CausalLongPFN and baseline evaluation configs
 
 src/clpfn/
@@ -79,8 +80,38 @@ src/clpfn/
   models/                   CausalLongPFN model
   training/                 Losses, optimizer setup, checkpointing, training loop
   evaluation/               PFN and baseline evaluation pipeline
-  baselines/                MSM, RMSN, G-Net, CRN, CT, and G-Transformer adapters
+  baselines/                MSM, RMSN, G-Net, and CT adapters
 ```
+
+## Pretraining ablations
+
+`configs/train/ablations/` holds seven single-mechanism ablations of the
+pretraining prior. Prior-mechanism ablations change what the sampled temporal
+structural causal model contains:
+
+- `no_motifs`
+- `no_latent_heterogeneity`
+- `no_confounding`
+- `immediate_effects_only`
+
+Supervision-mixture ablations change how the query target is constructed rather
+than what the sampled model contains. The canonical prior draws a factual query
+with probability 0.50 and an interventional structural-replay query otherwise;
+these two variants pin that mixture to its endpoints:
+
+- `factual_pretraining_only` (`OBSERVATIONAL_QUERY_PROB = 1.0`): the model never
+  sees a counterfactual target during pretraining.
+- `counterfactual_pretraining_only` (`OBSERVATIONAL_QUERY_PROB = 0.0`): every
+  query target is an interventional structural replay.
+
+In-context interface ablation:
+
+- `single_anchor_support` (`N_SUPPORT_ANCHORS = 1`): one labeled support anchor
+  per support trajectory instead of the canonical four.
+
+Each ablation changes one pretraining mechanism while retaining the model
+architecture. The 2,500-step `canonical_reference` configuration is the matched
+comparator for all seven.
 
 ## Installation
 
@@ -130,8 +161,16 @@ from huggingface_hub import hf_hub_download
 
 weights_path = hf_hub_download(
     repo_id="Amirhossein-Zare/causal-long-pfn",
-    filename="causal-long-pfn-v1-step10000.safetensors",
+    filename="causal-long-pfn-seed42-step10000.safetensors",
 )
+```
+
+`--checkpoint` accepts a training `.pt` file, a released `.safetensors` file, or a
+directory holding the downloaded release:
+
+```bash
+huggingface-cli download Amirhossein-Zare/causal-long-pfn --local-dir weights
+clpfn-eval --method pfn --config configs/eval/pfn.yaml --checkpoint weights
 ```
 
 ## End-to-end workflow
@@ -153,10 +192,10 @@ clpfn-generate-all --config configs/data/all_benchmarks.yaml --only cancer hiv w
 By default, outputs are written under:
 
 ```text
-outputs/data/cancer
-outputs/data/hiv
-outputs/data/warfarin
-outputs/data/mimic
+outputs/benchmarks/cancer
+outputs/benchmarks/hiv
+outputs/benchmarks/warfarin
+outputs/benchmarks/mimic
 ```
 
 ### 2. Train CausalLongPFN
@@ -169,7 +208,7 @@ The default training config uses synthetic TSCM episodes generated on the fly.
 Checkpoints are written to:
 
 ```text
-outputs/causal_long_pfn_outputs
+outputs/paper_runs/causal_long_pfn/seed_42
 ```
 
 To resume from an existing checkpoint directory or write to a different output
@@ -178,8 +217,8 @@ directory:
 ```bash
 clpfn-train \
   --config configs/train/causal_long_pfn.yaml \
-  --ckpt-input-dir outputs/causal_long_pfn_outputs \
-  --output-dir outputs/causal_long_pfn_outputs
+  --ckpt-input-dir outputs/paper_runs/causal_long_pfn/seed_42 \
+  --output-dir outputs/paper_runs/causal_long_pfn/seed_42
 ```
 
 ### 3. Build PFN-ready evaluation files
@@ -194,7 +233,7 @@ clpfn-build-ready --config configs/eval/pfn.yaml
 The default output directory is:
 
 ```text
-outputs/pfn_ready/all_domains
+outputs/pfn_ready
 ```
 
 ### 4. Evaluate CausalLongPFN
@@ -203,14 +242,14 @@ outputs/pfn_ready/all_domains
 clpfn-eval \
   --method pfn \
   --config configs/eval/pfn.yaml \
-  --checkpoint outputs/causal_long_pfn_outputs/ckpt_final.pt
+  --checkpoint outputs/paper_runs/causal_long_pfn/seed_42/ckpt_final.pt
 ```
 
 Evaluation outputs are written under the configured `evaluation.output_dir`, by
 default:
 
 ```text
-outputs/eval/causal_long_pfn
+outputs/paper_evaluations/causal_long_pfn/seed_42
 ```
 
 The main files are:
@@ -231,15 +270,21 @@ calibration_rows.parquet
 
 ### 5. Evaluate baselines
 
-Each baseline has its own config under `configs/eval/`:
+Each baseline has its own config under `configs/eval/`. For the tuned baselines,
+tuning and evaluation are separate operations: tuning writes a
+selected-hyperparameter manifest that the evaluation run then consumes.
 
 ```bash
-clpfn-eval --method msm          --config configs/eval/msm.yaml
-clpfn-eval --method rmsn         --config configs/eval/rmsn.yaml
-clpfn-eval --method gnet         --config configs/eval/gnet.yaml
-clpfn-eval --method crn          --config configs/eval/crn.yaml
-clpfn-eval --method ct           --config configs/eval/ct.yaml
-clpfn-eval --method gtransformer --config configs/eval/gtransformer.yaml
+clpfn-eval --method msm --config configs/eval/msm.yaml --mode tune
+clpfn-eval --method msm --config configs/eval/msm.yaml --mode evaluate
+```
+
+The same two-step form applies to `rmsn`, `gnet`, and `ct`. The two reference
+baselines need no tuning and run in a single step:
+
+```bash
+clpfn-eval --method persistence           --config configs/eval/persistence.yaml
+clpfn-eval --method linear_autoregressive --config configs/eval/linear_autoregressive.yaml
 ```
 
 Baselines are trained and selected on the target support data according to their
@@ -279,9 +324,9 @@ Most behavior is controlled through YAML files:
 - `configs/eval/*.yaml` set baseline-specific hyperparameter search spaces,
   limits, and output directories.
 
-The default benchmark grid uses support sizes `40, 80, 160, 320, 500`, ten
-confounding/task-index levels, two repetitions per cell, sequence length `60`,
-and horizon `5`.
+The default benchmark grid uses support sizes `40, 80, 160, 320, 500`, five
+confounding/task-index levels (`gammas: 1, 3, 5, 7, 9`), one repetition per cell,
+sequence length `60`, and horizon `5`, giving 25 datasets per domain.
 
 ## Reported results
 
