@@ -14,7 +14,6 @@ def build_adamw_optimizer(model, lr, weight_decay):
         "bias",
         "norm",
         "query_label_embedding",
-        "support_y_stats_encoder",
         "static_encoder",
     )
 

@@ -5,127 +5,157 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from clpfn.baselines.common.api import canonical_hparams
-from clpfn.baselines.common.api import replace_mapping, require_baseline_config
+from clpfn.baselines.common.api import canonical_hparams, replace_mapping, require_baseline_config
+from clpfn.baselines.common.features import treatment_dim
 from clpfn.baselines.common.tuning import sample_random_hparams
 from clpfn.evaluation.core import benchmark as common
 
 
 OUTPUT_DIR = Path("outputs/eval/rmsn")
-
-N_ACTION_BITS = 2
-MAX_TRAIN_ORIGINS = 0
+N_ACTIONS = 4
+MAX_TRAIN_ORIGINS = None
 MAX_VAL_ORIGINS = 0
-PROP_BATCH_SIZE = 1
-ENCODER_BATCH_SIZE = 1
-DECODER_BATCH_SIZE = 1
 
-DEFAULT_HPARAMS = {}
-BASE_RMSN_SPACE = {}
-SCALED_SPACE = {}
-
-TUNING_CACHE = {}
+DEFAULT_HPARAMS: dict = {}
+BASE_RMSN_SPACE: dict = {}
+SCALED_SPACE: dict = {}
+STAGEWISE_TRIALS = {
+    "propensity_treatment": 40,
+    "propensity_history": 40,
+    "encoder": 40,
+    "decoder": 20,
+}
+TREATMENT_MODE_BY_DOMAIN: dict[str, str] = {
+    "cancer": "multilabel",
+    "hiv": "multiclass",
+    "warfarin": "multiclass",
+    "mimic": "multilabel",
+}
+_COMPONENTS = ("propensity_treatment", "propensity_history", "encoder", "decoder")
 
 
 def apply_config(config):
-    global N_ACTION_BITS, MAX_TRAIN_ORIGINS, MAX_VAL_ORIGINS
-    global PROP_BATCH_SIZE, ENCODER_BATCH_SIZE, DECODER_BATCH_SIZE
-
+    global N_ACTIONS, MAX_TRAIN_ORIGINS, MAX_VAL_ORIGINS
     config = require_baseline_config(config, "rmsn")
     limits = config["limits"]
-    N_ACTION_BITS = int(limits["n_action_bits"])
-    MAX_TRAIN_ORIGINS = int(limits["max_train_origins"])
+    N_ACTIONS = int(limits["n_actions"])
+    max_train_origins = limits.get("max_train_origins")
+    MAX_TRAIN_ORIGINS = None if max_train_origins is None else int(max_train_origins)
     MAX_VAL_ORIGINS = int(limits["max_val_origins"])
-    PROP_BATCH_SIZE = int(limits["prop_batch_size"])
-    ENCODER_BATCH_SIZE = int(limits["encoder_batch_size"])
-    DECODER_BATCH_SIZE = int(limits["decoder_batch_size"])
     replace_mapping(DEFAULT_HPARAMS, config["default_hparams"])
     replace_mapping(BASE_RMSN_SPACE, config["search_space"])
-    replace_mapping(SCALED_SPACE, config.get("scaled_space", {}))
-    TUNING_CACHE.clear()
+    replace_mapping(SCALED_SPACE, config["scaled_space"])
+    replace_mapping(TREATMENT_MODE_BY_DOMAIN, config["treatment_mode_by_domain"])
+    for domain, mode in TREATMENT_MODE_BY_DOMAIN.items():
+        if str(mode) not in {"multilabel", "multiclass"}:
+            raise ValueError(f"Invalid RMSN treatment mode for {domain}: {mode!r}")
+    stagewise = config["stagewise_tuning"]
+    STAGEWISE_TRIALS["propensity_treatment"] = int(stagewise["propensity_treatment_trials"])
+    STAGEWISE_TRIALS["propensity_history"] = int(stagewise["propensity_history_trials"])
+    STAGEWISE_TRIALS["encoder"] = int(stagewise["encoder_trials"])
+    STAGEWISE_TRIALS["decoder"] = int(stagewise["decoder_trials"])
+    if min(STAGEWISE_TRIALS.values()) < 1:
+        raise ValueError("RMSN stagewise trial counts must be positive.")
 
 
 def ns(**kwargs):
     return SimpleNamespace(**kwargs)
 
 
-def round_to_valid(values, min_value=None, max_value=None, multiple=None):
-    min_value = int(SCALED_SPACE.get("min_width", 32) if min_value is None else min_value)
-    max_value = int(SCALED_SPACE.get("max_width", 160) if max_value is None else max_value)
-    multiple = int(SCALED_SPACE.get("width_multiple", 16) if multiple is None else multiple)
+def treatment_mode_for_domain(domain: str) -> str:
+    key = str(domain).strip().lower()
+    if key not in TREATMENT_MODE_BY_DOMAIN:
+        raise ValueError(f"RMSN has no treatment mode for domain {domain!r}.")
+    return str(TREATMENT_MODE_BY_DOMAIN[key])
+
+
+def treatment_spec_for_bundle(bundle) -> tuple[str, int]:
+    mode = treatment_mode_for_domain(bundle["domain"])
+    return mode, treatment_dim(mode)
+
+
+def round_to_valid(values):
+    min_value = int(SCALED_SPACE["min_width"])
+    max_value = int(SCALED_SPACE["max_width"])
+    multiple = int(SCALED_SPACE["width_multiple"])
+    if multiple < 1:
+        raise ValueError("RMSN width_multiple must be positive.")
     out = []
     for value in values:
-        x = int(round(float(value) / multiple) * multiple)
-        out.append(max(int(min_value), min(int(max_value), x)))
+        if multiple == 1:
+            x = int(float(value))
+        else:
+            x = int(round(float(value) / multiple) * multiple)
+        out.append(max(min_value, min(max_value, x)))
     return sorted(set(out))
 
 
-def size_grid(width, min_value=None, max_value=None):
-    multipliers = SCALED_SPACE.get("width_multipliers", [0.5, 1.0, 2.0, 4.0])
-    return round_to_valid([float(multiplier) * width for multiplier in multipliers], min_value=min_value, max_value=max_value)
+def component_multipliers(component):
+    if component == "decoder":
+        return list(SCALED_SPACE["decoder_width_multipliers"])
+    return list(SCALED_SPACE["width_multipliers"])
 
 
-def build_group_scaled_space(d_base):
-    c_hist = N_ACTION_BITS + int(d_base) + 1 + common.D_STATIC_MAX
-    c_dec = N_ACTION_BITS + 1 + common.D_STATIC_MAX
-    enc_sizes = size_grid(c_hist)
-    dec_sizes = size_grid(c_dec)
-    practical = [int(value) for value in SCALED_SPACE.get("practical_widths", [])]
-    enc_sizes = sorted(set(enc_sizes + practical))
-    dec_sizes = sorted(set(dec_sizes + practical))
+def component_practical_widths(component):
+    return [int(value) for value in SCALED_SPACE["practical_widths"]]
+
+
+def size_grid(width, component):
+    multipliers = component_multipliers(component)
+    return round_to_valid([float(multiplier) * width for multiplier in multipliers])
+
+
+def build_group_scaled_space(d_base, treatment_mode, d_static):
+    dim_treatments = treatment_dim(treatment_mode)
+    d_static = int(d_static)
+    sizes = {
+        "propensity_treatment": dim_treatments,
+        "propensity_history": dim_treatments + int(d_base) + 1 + d_static,
+        "encoder": dim_treatments + int(d_base) + 1 + d_static,
+        "decoder": dim_treatments + 1 + d_static,
+    }
+    grids = {
+        name: sorted(set(size_grid(width, component=name) + component_practical_widths(name)))
+        for name, width in sizes.items()
+    }
     space = dict(BASE_RMSN_SPACE)
-    space["hidden_units_encoder"] = enc_sizes
-    space["hidden_units_decoder"] = dec_sizes
+    for component in _COMPONENTS:
+        space[f"hidden_units_{component}"] = grids[component]
     return space, {
-        "C_hist": int(c_hist),
-        "C_dec": int(c_dec),
-        "encoder_size_grid": enc_sizes,
-        "decoder_size_grid": dec_sizes,
+        "treatment_mode": treatment_mode,
+        "dim_treatments": int(dim_treatments),
+        **{f"C_{name}": int(width) for name, width in sizes.items()},
+        **{f"{name}_size_grid": values for name, values in grids.items()},
     }
 
 
-def make_rmsn_args(d_vitals, hparams):
-    def submodel_cfg(hidden_units, lr, batch_size):
+def make_rmsn_args(d_vitals, hparams, treatment_mode, d_static):
+    def submodel_cfg(component):
         return ns(
-            seq_hidden_units=int(hidden_units),
-            dropout_rate=float(hparams["dropout"]),
-            num_layer=int(hparams["num_layers"]),
-            batch_size=int(batch_size),
-            max_grad_norm=float(hparams["max_grad_norm"]),
+            seq_hidden_units=int(hparams[f"hidden_units_{component}"]),
+            dropout_rate=float(hparams[f"dropout_{component}"]),
+            num_layer=int(hparams[f"num_layers_{component}"]),
+            batch_size=int(hparams[f"batch_size_{component}"]),
+            max_grad_norm=float(hparams[f"max_grad_norm_{component}"]),
             optimizer={
-                "learning_rate": float(lr),
-                "weight_decay": float(hparams.get("weight_decay", 1e-5)),
-                "optimizer_cls": str(hparams.get("optimizer_cls", "adamw")),
+                "learning_rate": float(hparams[f"lr_{component}"]),
+                "weight_decay": float(hparams["weight_decay"]),
+                "optimizer_cls": str(hparams["optimizer_cls"]),
                 "lr_scheduler": False,
             },
         )
 
-    propensity_treatment = submodel_cfg(
-        hparams["hidden_units_encoder"],
-        hparams["lr_prop"],
-        hparams["batch_size_encoder"],
-    )
-    propensity_history = submodel_cfg(
-        hparams["hidden_units_encoder"],
-        hparams["lr_prop"],
-        hparams["batch_size_encoder"],
-    )
-    encoder = submodel_cfg(
-        hparams["hidden_units_encoder"],
-        hparams["lr_enc"],
-        hparams["batch_size_encoder"],
-    )
-    decoder = submodel_cfg(
-        hparams["hidden_units_decoder"],
-        hparams["lr_dec"],
-        hparams["batch_size_decoder"],
-    )
-
+    propensity_treatment = submodel_cfg("propensity_treatment")
+    propensity_history = submodel_cfg("propensity_history")
+    encoder = submodel_cfg("encoder")
+    decoder = submodel_cfg("decoder")
+    dim_treatments = treatment_dim(treatment_mode)
+    d_static = int(d_static)
     return ns(
         model=ns(
-            dim_treatments=N_ACTION_BITS,
+            dim_treatments=dim_treatments,
             dim_vitals=int(d_vitals),
-            dim_static_features=common.D_STATIC_MAX,
+            dim_static_features=d_static,
             dim_outcomes=1,
             encoder=encoder,
             decoder=decoder,
@@ -133,9 +163,9 @@ def make_rmsn_args(d_vitals, hparams):
             propensity_history=propensity_history,
         ),
         dataset=ns(
-            val_batch_size=int(hparams["batch_size_encoder"]),
+            val_batch_size=int(encoder.batch_size),
             projection_horizon=common.PROJECTION_HORIZON,
-            treatment_mode="multilabel",
+            treatment_mode=str(treatment_mode),
             holdout_ratio=0.0,
         ),
         exp=ns(
@@ -143,58 +173,43 @@ def make_rmsn_args(d_vitals, hparams):
             percentage_rmse=False,
             bce_weight=False,
             gpus="[]",
-            max_epochs=max(
-                int(hparams["propensity_epochs"]),
-                int(hparams["encoder_epochs"]),
-                int(hparams["decoder_epochs"]),
-            ),
+            max_epochs=max(int(hparams["propensity_epochs"]), int(hparams["encoder_epochs"]), int(hparams["decoder_epochs"])),
             alpha_rate="exp",
             update_alpha=False,
         ),
     )
 
 
-def action4_to_bits(actions):
-    actions = np.asarray(actions, dtype=np.int64)
-    return np.stack([(actions & 1), ((actions >> 1) & 1)], axis=-1).astype(np.float32)
-
-
 def sample_random_candidates(space, n, seed):
-    return sample_random_hparams(
-        space,
-        n,
-        seed,
-        default_hparams=DEFAULT_HPARAMS,
-        canonical_hparams=canonical_hparams,
-    )
+    return sample_random_hparams(space, n, seed, default_hparams=DEFAULT_HPARAMS, canonical_hparams=canonical_hparams)
 
 
 def clip_normalize_weights(weights, active, quantiles=(0.01, 0.99), multiple_horizons=False):
     weights = np.asarray(weights, dtype=np.float32).copy()
     active_bool = np.asarray(active).astype(bool)
     weights[~active_bool] = np.nan
-
-    finite = np.isfinite(weights)
-    if finite.sum() == 0:
-        out = np.zeros_like(weights, dtype=np.float32)
-        out[active_bool] = 1.0
-        return out
-
+    if np.isfinite(weights).sum() == 0:
+        raise RuntimeError("RMSN has no finite active stabilized weights.")
     lo, hi = quantiles
-    qlo = np.nanquantile(weights, float(lo))
-    qhi = np.nanquantile(weights, float(hi))
-    weights = np.clip(weights, qlo, qhi)
-
+    weights = np.clip(weights, np.nanquantile(weights, float(lo)), np.nanquantile(weights, float(hi)))
     if multiple_horizons:
-        denom = np.nanmean(weights, axis=0, keepdims=True)
-        denom = np.where(np.isfinite(denom) & (np.abs(denom) > 1e-8), denom, 1.0)
+        denom = np.ones((1, weights.shape[1]), dtype=np.float32)
+        for horizon in range(weights.shape[1]):
+            values = weights[:, horizon]
+            values = values[np.isfinite(values)]
+            if not values.size:
+                continue
+            mean = float(values.mean())
+            if not np.isfinite(mean) or abs(mean) <= 1e-8:
+                raise RuntimeError(f"RMSN weights have an invalid mean at horizon {horizon}.")
+            denom[0, horizon] = mean
         weights = weights / denom
     else:
-        denom = np.nanmean(weights)
+        denom = float(np.nanmean(weights))
         if not np.isfinite(denom) or abs(denom) < 1e-8:
-            denom = 1.0
+            raise RuntimeError("RMSN weights have an invalid mean.")
         weights = weights / denom
-
+    if not np.isfinite(weights[active_bool]).all():
+        raise RuntimeError("RMSN produced non-finite normalized weights.")
     weights[~active_bool] = 0.0
-    weights[~np.isfinite(weights)] = 0.0
     return weights.astype(np.float32)

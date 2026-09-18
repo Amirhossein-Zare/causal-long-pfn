@@ -7,20 +7,16 @@ from clpfn.baselines.common.runner import run_all as run_adapter
 
 
 ADAPTER_MODULES = {
-    "crn": "clpfn.baselines.crn.train",
     "ct": "clpfn.baselines.ct.train",
     "gnet": "clpfn.baselines.gnet.train",
-    "gtransformer": "clpfn.baselines.gtransformer.train",
     "msm": "clpfn.baselines.msm.train",
     "rmsn": "clpfn.baselines.rmsn.train",
 }
 
 
 DEFAULT_CONFIGS = {
-    "crn": "configs/eval/crn.yaml",
     "ct": "configs/eval/ct.yaml",
     "gnet": "configs/eval/gnet.yaml",
-    "gtransformer": "configs/eval/gtransformer.yaml",
     "msm": "configs/eval/msm.yaml",
     "rmsn": "configs/eval/rmsn.yaml",
 }
@@ -31,7 +27,7 @@ def available_baselines() -> tuple[str, ...]:
 
 
 def normalize_method(method: str) -> str:
-    key = str(method).lower().replace("-", "").replace("_", "")
+    key = str(method).strip().lower()
     if key not in ADAPTER_MODULES:
         choices = ", ".join(available_baselines())
         raise ValueError(f"Unknown baseline '{method}'. Available baselines: {choices}.")

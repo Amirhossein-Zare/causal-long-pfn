@@ -10,9 +10,6 @@ MAX_VAL_ORIGINS = 0
 DEFAULT_HPARAMS = {}
 GNET_SPACE = {}
 
-TUNING_CACHE = {}
-
-
 def apply_config(config):
     global MAX_VAL_ORIGINS
 
@@ -21,4 +18,3 @@ def apply_config(config):
     MAX_VAL_ORIGINS = int(limits["max_val_origins"])
     replace_mapping(DEFAULT_HPARAMS, config["default_hparams"])
     replace_mapping(GNET_SPACE, config["search_space"])
-    TUNING_CACHE.clear()

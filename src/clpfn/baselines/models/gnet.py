@@ -14,8 +14,7 @@ logger = logging.getLogger(__name__)
 
 class GNet(TimeVaryingCausalModel):
     """
-    GNet method with one explicit benchmark extension:
-      - vitals_loss_weight is tunable.
+    G-Net port using the reference single conditional output component.
 
     Model structure:
       - model_type = g_net
@@ -163,7 +162,7 @@ class GNet(TimeVaryingCausalModel):
         else:
             mse_loss_vitals = 0.0
 
-        vitals_loss_weight = float(getattr(self.hparams.model.g_net, "vitals_loss_weight", 1.0))
+        vitals_loss_weight = float(self.hparams.model.g_net.vitals_loss_weight)
         mse_loss = mse_loss_outcome + vitals_loss_weight * mse_loss_vitals
 
         self.log(f"{self.model_type}_train_mse_loss_outcomes", mse_loss_outcome)
@@ -213,7 +212,7 @@ class GNet(TimeVaryingCausalModel):
         self.eval()
         loader = DataLoader(
             dataset,
-            batch_size=getattr(self.hparams.dataset, "val_batch_size", 64),
+            batch_size=self.hparams.dataset.val_batch_size,
             shuffle=False,
         )
         predictions = []
@@ -224,7 +223,7 @@ class GNet(TimeVaryingCausalModel):
 
         outcome_next_vitals_pred = np.concatenate(predictions, axis=0)
         if vitals:
-            return outcome_next_vitals_pred[:, :, self.dim_outcome:]
+            return outcome_next_vitals_pred
         return outcome_next_vitals_pred[:, :, :self.dim_outcome]
 
     def get_autoregressive_predictions(self, datasets: list) -> np.array:

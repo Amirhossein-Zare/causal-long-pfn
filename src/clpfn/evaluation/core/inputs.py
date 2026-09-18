@@ -19,9 +19,12 @@ class ReadyBenchmarkInputs:
     @classmethod
     def from_dict(cls, values: dict[str, Any] | None = None) -> "ReadyBenchmarkInputs":
         values = dict(values or {})
+        unknown = sorted(set(values) - {"ready_dirs", "ready_paths"})
+        if unknown:
+            raise KeyError(f"Unknown ready benchmark input keys: {unknown}")
         return cls(
-            ready_dirs=tuple(str(path) for path in values.get("ready_dirs", []) or []),
-            ready_paths=tuple(str(path) for path in values.get("ready_paths", []) or []),
+            ready_dirs=tuple(str(path) for path in values["ready_dirs"]) if "ready_dirs" in values else (),
+            ready_paths=tuple(str(path) for path in values["ready_paths"]) if "ready_paths" in values else (),
         )
 
     def validate(self) -> None:

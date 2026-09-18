@@ -1,0 +1,14 @@
+method: linear_autoregressive
+
+data:
+  wanted_domains: [cancer, hiv, warfarin, mimic]
+  ready_inputs:
+    ready_dirs:
+      - outputs/pfn_ready
+
+evaluation:
+  output_dir: outputs/eval/linear_autoregressive
+
+baseline:
+  min_train_samples: 16
+  max_train_samples: 200000

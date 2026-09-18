@@ -9,8 +9,8 @@ from sklearn.linear_model import LinearRegression, LogisticRegression, Ridge
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
-from clpfn.baselines.models.time_varying_model import TimeVaryingCausalModel, cfg_get
-from clpfn.baselines.msm.config import N_ACTION_BITS
+from clpfn.baselines.models.time_varying_model import TimeVaryingCausalModel
+from clpfn.baselines.common.features import treatment_dim
 from clpfn.baselines.msm.data import (
     build_propensity_training_data,
     build_regression_data_for_tau,
@@ -21,29 +21,29 @@ from clpfn.evaluation.core import benchmark as common
 logger = logging.getLogger(__name__)
 
 
-def make_msm_args(hparams):
+def make_msm_args(hparams, dim_static_features, treatment_mode):
+    dim_static_features = int(dim_static_features)
     return SimpleNamespace(
         model=SimpleNamespace(
-            dim_treatments=N_ACTION_BITS,
+            dim_treatments=treatment_dim(treatment_mode),
             dim_vitals=0,
-            dim_static_features=common.D_STATIC_MAX,
+            dim_static_features=dim_static_features,
             dim_outcomes=1,
             lag_features=int(hparams["lag_features"]),
         ),
         dataset=SimpleNamespace(
             projection_horizon=common.PROJECTION_HORIZON,
-            treatment_mode="multilabel",
+            treatment_mode=str(treatment_mode),
         ),
-        exp=SimpleNamespace(max_epochs=int(hparams.get("max_logistic_iter", 500))),
+        exp=SimpleNamespace(max_epochs=int(hparams["max_logistic_iter"])),
     )
 
 
 class BinaryMultiOutputProbModel:
     """One logistic propensity model per binary treatment bit."""
 
-    def __init__(self, n_bits=N_ACTION_BITS, logistic_C=1e6, max_iter=500):
+    def __init__(self, n_bits, max_iter=500):
         self.n_bits = int(n_bits)
-        self.logistic_C = float(logistic_C)
         self.max_iter = int(max_iter)
         self.models = []
 
@@ -66,8 +66,7 @@ class BinaryMultiOutputProbModel:
             model = make_pipeline(
                 StandardScaler(),
                 LogisticRegression(
-                    C=self.logistic_C,
-                    penalty="l2",
+                    penalty=None,
                     solver="lbfgs",
                     max_iter=self.max_iter,
                 ),
@@ -90,12 +89,55 @@ class BinaryMultiOutputProbModel:
         return np.clip(out, 1e-6, 1.0 - 1e-6)
 
 
+
+class MulticlassProbModel:
+    """Single multinomial logistic propensity model for categorical actions."""
+
+    def __init__(self, n_classes=4, max_iter=500):
+        self.n_classes = int(n_classes)
+        self.max_iter = int(max_iter)
+        self.model = None
+
+    def fit(self, X, Y):
+        X = np.asarray(X, dtype=np.float32)
+        Y = np.asarray(Y, dtype=np.int64).reshape(-1)
+        if X.shape[0] < 10:
+            raise ValueError(f"Need at least 10 propensity rows, got {X.shape[0]}.")
+        if np.unique(Y).size < 2:
+            raise ValueError("Categorical propensity data contain one class only.")
+        self.model = make_pipeline(
+            StandardScaler(),
+            LogisticRegression(
+                penalty=None, solver="lbfgs",
+                max_iter=self.max_iter,
+            ),
+        )
+        self.model.fit(X, Y)
+        return self
+
+    def predict_observed_proba(self, X, observed):
+        if self.model is None:
+            raise RuntimeError("Propensity model must be fitted before prediction.")
+        X = np.asarray(X, dtype=np.float32)
+        observed = np.asarray(observed, dtype=np.int64).reshape(-1)
+        proba = self.model.predict_proba(X)
+        classes = self.model.named_steps["logisticregression"].classes_
+        class_to_col = {int(c): j for j, c in enumerate(classes)}
+        missing = sorted(set(int(a) for a in observed) - set(class_to_col))
+        if missing:
+            raise RuntimeError(f"Propensity model has no fitted classes for actions {missing}.")
+        out = np.asarray(
+            [proba[i, class_to_col[int(a)]] for i, a in enumerate(observed)],
+            dtype=np.float64,
+        )
+        return np.clip(out, 1e-6, 1.0)
+
 def make_regressor(hparams):
-    regressor = str(hparams.get("regressor", "ridge")).lower()
+    regressor = str(hparams["regressor"]).lower()
     if regressor == "linear":
         return LinearRegression()
     if regressor == "ridge":
-        return Ridge(alpha=float(hparams.get("ridge_alpha", 1.0)))
+        return Ridge(alpha=float(hparams["ridge_alpha"]))
     raise ValueError(f"Unknown MSM regressor: {regressor}")
 
 
@@ -119,7 +161,7 @@ class MSM(TimeVaryingCausalModel):
         **kwargs,
     ):
         super().__init__(args, dataset_collection, autoregressive, has_vitals)
-        self.lag_features = int(cfg_get(args.model, "lag_features", 0))
+        self.lag_features = int(args.model.lag_features)
 
 
 class MSMPropensityTreatment(MSM):
@@ -132,10 +174,11 @@ class MSMPropensityTreatment(MSM):
         super().__init__(args, dataset_collection, autoregressive, has_vitals)
         self.input_size = self.dim_treatments
         self.output_size = self.dim_treatments
-        self.model = BinaryMultiOutputProbModel(
+        self.treatment_mode = str(args.dataset.treatment_mode)
+        model_cls = BinaryMultiOutputProbModel if self.treatment_mode == "multilabel" else MulticlassProbModel
+        self.model = model_cls(
             self.dim_treatments,
-            logistic_C=cfg_get(args.model, "logistic_C", 1e6),
-            max_iter=cfg_get(args.exp, "max_epochs", 500),
+            max_iter=args.exp.max_epochs,
         )
 
     def fit_arrays(self, X, Y):
@@ -144,6 +187,13 @@ class MSMPropensityTreatment(MSM):
 
     def predict_proba_one(self, X):
         return self.model.predict_proba_one(X)
+
+    def predict_observed_proba(self, X, observed):
+        if self.treatment_mode == "multiclass":
+            return self.model.predict_observed_proba(X, observed)
+        p1 = self.model.predict_proba_one(X)
+        obs = np.asarray(observed, dtype=np.float64)
+        return np.prod(p1 * obs + (1.0 - p1) * (1.0 - obs), axis=-1)
 
 
 class MSMPropensityHistory(MSM):
@@ -156,10 +206,11 @@ class MSMPropensityHistory(MSM):
         super().__init__(args, dataset_collection, autoregressive, has_vitals)
         self.input_size = None
         self.output_size = self.dim_treatments
-        self.model = BinaryMultiOutputProbModel(
+        self.treatment_mode = str(args.dataset.treatment_mode)
+        model_cls = BinaryMultiOutputProbModel if self.treatment_mode == "multilabel" else MulticlassProbModel
+        self.model = model_cls(
             self.dim_treatments,
-            logistic_C=cfg_get(args.model, "logistic_C", 1e6),
-            max_iter=cfg_get(args.exp, "max_epochs", 500),
+            max_iter=args.exp.max_epochs,
         )
 
     def fit_arrays(self, X, Y):
@@ -168,6 +219,13 @@ class MSMPropensityHistory(MSM):
 
     def predict_proba_one(self, X):
         return self.model.predict_proba_one(X)
+
+    def predict_observed_proba(self, X, observed):
+        if self.treatment_mode == "multiclass":
+            return self.model.predict_observed_proba(X, observed)
+        p1 = self.model.predict_proba_one(X)
+        obs = np.asarray(observed, dtype=np.float64)
+        return np.prod(p1 * obs + (1.0 - p1) * (1.0 - obs), axis=-1)
 
 
 class MSMRegressor(MSM):
@@ -195,11 +253,13 @@ class MSMRegressor(MSM):
         self.msm_regressor: dict[int, object] = {}
         self.train_info: dict[int, dict] = {}
         self.train_diag: dict = {}
-        self.fit_hparams = dict(hparams or {})
+        if hparams is None:
+            raise ValueError("MSMRegressor requires fitted hyperparameters.")
+        self.fit_hparams = dict(hparams)
 
     @classmethod
-    def from_hparams(cls, hparams: dict):
-        args = make_msm_args(hparams)
+    def from_hparams(cls, hparams: dict, dim_static_features, treatment_mode):
+        args = make_msm_args(hparams, dim_static_features=dim_static_features, treatment_mode=treatment_mode)
         prop_treatment = MSMPropensityTreatment(args)
         prop_history = MSMPropensityHistory(args)
         return cls(args, prop_treatment, prop_history, hparams=hparams)
@@ -212,29 +272,28 @@ class MSMRegressor(MSM):
         data = build_propensity_training_data(bundle, self.fit_hparams, context_indices)
         if data is None:
             raise ValueError("No MSM propensity training rows are available.")
-        x_num, x_den, y_bits, pairs = data
-        if len(y_bits) < 20:
-            raise ValueError(f"Need at least 20 MSM propensity rows, got {len(y_bits)}.")
+        x_num, x_den, observed_treatment, pairs = data
+        if len(observed_treatment) < 20:
+            raise ValueError(f"Need at least 20 MSM propensity rows, got {len(observed_treatment)}.")
 
-        self.propensity_treatment.fit_arrays(x_num, y_bits)
-        self.propensity_history.fit_arrays(x_den, y_bits)
+        self.propensity_treatment.fit_arrays(x_num, observed_treatment)
+        self.propensity_history.fit_arrays(x_den, observed_treatment)
 
-        p_num_1 = self.propensity_treatment.predict_proba_one(x_num)
-        p_den_1 = self.propensity_history.predict_proba_one(x_den)
-        obs = np.asarray(y_bits, dtype=np.float64)
-        p_num = np.prod(p_num_1 * obs + (1.0 - p_num_1) * (1.0 - obs), axis=-1)
-        p_den = np.prod(p_den_1 * obs + (1.0 - p_den_1) * (1.0 - obs), axis=-1)
+        p_num = self.propensity_treatment.predict_observed_proba(x_num, observed_treatment)
+        p_den = self.propensity_history.predict_observed_proba(x_den, observed_treatment)
         ratios = p_num / np.maximum(p_den, 1e-6)
-        ratios = np.nan_to_num(ratios, nan=1.0, posinf=1.0, neginf=1.0)
+        if not np.isfinite(ratios).all():
+            raise RuntimeError("MSM produced non-finite stabilized propensity ratios.")
         ratios = np.clip(ratios, 1e-3, 1e3)
 
         for ratio, (row_idx, time_idx) in zip(ratios, pairs):
-            if 0 <= int(row_idx) < n_ctx and 0 <= int(time_idx) < time_dim:
-                sw_matrix[int(row_idx), int(time_idx)] = float(ratio)
+            if not 0 <= int(row_idx) < n_ctx or not 0 <= int(time_idx) < time_dim:
+                raise IndexError("MSM propensity row points outside the support matrix.")
+            sw_matrix[int(row_idx), int(time_idx)] = float(ratio)
 
         prop_info = {
             "propensity_status": "ok",
-            "n_propensity": int(len(y_bits)),
+            "n_propensity": int(len(observed_treatment)),
             "mean_weight_raw": float(np.mean(ratios)),
         }
         return sw_matrix, prop_info
@@ -253,7 +312,7 @@ class MSMRegressor(MSM):
                 self.fit_hparams,
                 context_indices,
             )
-            min_train = int(self.fit_hparams.get("min_train_per_tau", 5))
+            min_train = int(self.fit_hparams["min_train_per_tau"])
             if x_reg is None or len(y_reg) < min_train:
                 raise ValueError(f"Need at least {min_train} MSM rows for tau={tau}.")
 
@@ -300,8 +359,10 @@ class MSMRegressor(MSM):
             t=t_obs,
             tau=tau,
             lag_features=self.lag_features,
+            treatment_mode=str(self.hparams.dataset.treatment_mode),
         ).reshape(1, -1)
         pred_norm = float(self.msm_regressor[tau].predict(features)[0])
         info = dict(self.train_info[tau])
         info["pred_status"] = "ok"
+        info["prediction_model_norm_unclipped"] = pred_norm
         return float(np.clip(pred_norm, -common.PRED_CLIP_REPORT, common.PRED_CLIP_REPORT)), info

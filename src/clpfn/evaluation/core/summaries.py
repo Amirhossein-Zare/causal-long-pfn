@@ -11,7 +11,7 @@ LOGGER = logging.getLogger(__name__)
 
 DOMAIN_TASK_RMSE_COLUMNS = [
     "domain",
-    "task_step",
+    "reported_task",
     "method",
     "mean_norm_rmse",
     "std_norm_rmse",
@@ -30,7 +30,7 @@ def _normalized_predictions(df: pd.DataFrame) -> pd.DataFrame:
         "method",
         "run_id",
         "gamma",
-        "task_step",
+        "reported_task",
         "task_name",
         "tau",
         "dataset_id",
@@ -45,7 +45,9 @@ def _normalized_predictions(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     out["domain"] = out["domain"].astype(str).str.lower().str.strip()
     out["method"] = out["method"].astype(str)
-    out["task_step"] = out["task_step"].astype(str)
+    if "reported_task" not in out:
+        raise KeyError("Prediction dataframe is missing required column: reported_task")
+    out["reported_task"] = out["reported_task"].astype(str)
     out["sq_error_norm"] = pd.to_numeric(out["sq_error_norm"], errors="coerce")
 
     return out[np.isfinite(out["sq_error_norm"])].copy()
@@ -54,18 +56,18 @@ def _normalized_predictions(df: pd.DataFrame) -> pd.DataFrame:
 def prediction_unit_rmse(pred_df: pd.DataFrame) -> pd.DataFrame:
     """Return one RMSE row per method/run/domain/task/dataset unit."""
     if pred_df.empty:
-        return pd.DataFrame(columns=["domain", "task_step", "method", "norm_rmse"])
+        return pd.DataFrame(columns=["domain", "reported_task", "method", "norm_rmse"])
 
     df = _normalized_predictions(pred_df)
     if df.empty:
-        return pd.DataFrame(columns=["domain", "task_step", "method", "norm_rmse"])
+        return pd.DataFrame(columns=["domain", "reported_task", "method", "norm_rmse"])
 
     unit_cols = [
         "method",
         "run_id",
         "domain",
         "gamma",
-        "task_step",
+        "reported_task",
         "task_name",
         "tau",
         "dataset_id",
@@ -86,7 +88,7 @@ def summarize_domain_task_rmse(pred_df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame(columns=DOMAIN_TASK_RMSE_COLUMNS)
 
     summary = (
-        units.groupby(["domain", "task_step", "method"], dropna=False)
+        units.groupby(["domain", "reported_task", "method"], dropna=False)
         .agg(
             mean_norm_rmse=("norm_rmse", "mean"),
             std_norm_rmse=("norm_rmse", "std"),
@@ -94,7 +96,7 @@ def summarize_domain_task_rmse(pred_df: pd.DataFrame) -> pd.DataFrame:
         .reset_index()
     )
     summary["std_norm_rmse"] = summary["std_norm_rmse"].fillna(0.0)
-    return summary[DOMAIN_TASK_RMSE_COLUMNS].sort_values(["task_step", "domain", "method"]).reset_index(drop=True)
+    return summary[DOMAIN_TASK_RMSE_COLUMNS].sort_values(["reported_task", "domain", "method"]).reset_index(drop=True)
 
 
 def print_summary_table(df: pd.DataFrame, title: str) -> None:

@@ -117,13 +117,13 @@ def support_val_candidates(bundle: dict[str, Any], val_idx, seed: int, max_val_o
     candidates = []
 
     for i in np.asarray(val_idx, dtype=np.int64):
-        max_origin = min(int(lengths[i]) - 2, y_norm.shape[1] - 2, common.MAX_INPUT_INDEX)
+        max_origin = min(int(lengths[i]) - 1, y_norm.shape[1] - 2, common.MAX_INPUT_INDEX)
         if max_origin < common.MIN_T_OBS:
             continue
         for origin in range(common.MIN_T_OBS, max_origin + 1):
             candidates.append((int(i), int(origin), int(origin + 1)))
             horizon_target = origin + common.PROJECTION_HORIZON
-            if horizon_target < int(lengths[i]) and horizon_target < y_norm.shape[1]:
+            if horizon_target <= int(lengths[i]) and horizon_target < y_norm.shape[1]:
                 candidates.append((int(i), int(origin), int(horizon_target)))
 
     if len(candidates) > max_val_origins:
@@ -132,13 +132,30 @@ def support_val_candidates(bundle: dict[str, Any], val_idx, seed: int, max_val_o
     return candidates
 
 
+
+def support_val_one_step_candidates(bundle: dict[str, Any], val_idx, seed: int, max_val_origins: int):
+    """Sample factual one-step validation origins, matching CT/G-Net references."""
+    rng = np.random.default_rng(int(seed))
+    y_norm = bundle["y_norm_clip"]
+    lengths = bundle["sequence_lengths"]
+    candidates = []
+
+    for i in np.asarray(val_idx, dtype=np.int64):
+        max_origin = min(int(lengths[i]) - 1, y_norm.shape[1] - 2, common.MAX_INPUT_INDEX)
+        if max_origin < common.MIN_T_OBS:
+            continue
+        for origin in range(common.MIN_T_OBS, max_origin + 1):
+            candidates.append((int(i), int(origin), int(origin + 1)))
+
+    if len(candidates) > int(max_val_origins):
+        keep = rng.choice(len(candidates), size=int(max_val_origins), replace=False)
+        candidates = [candidates[int(k)] for k in keep]
+    return candidates
+
 def targets_for_candidates(bundle: dict[str, Any], candidates) -> np.ndarray:
     y_norm = bundle["y_norm_clip"]
     return np.asarray(
-        [
-            float(np.clip(y_norm[row_id, target_t], -common.TARGET_NORM_CLIP, common.TARGET_NORM_CLIP))
-            for row_id, _, target_t in candidates
-        ],
+        [float(y_norm[row_id, target_t]) for row_id, _, target_t in candidates],
         dtype=np.float32,
     )
 
@@ -148,25 +165,6 @@ def rmse_from_predictions(predictions, targets) -> float:
     target = np.asarray(targets, dtype=np.float32)
     mask = np.isfinite(pred) & np.isfinite(target)
     return float(np.sqrt(np.mean((pred[mask] - target[mask]) ** 2))) if mask.any() else float("nan")
-
-
-def evaluate_single_rollout_val_rmse(
-    bundle: dict[str, Any],
-    model: Any,
-    val_idx,
-    seed: int,
-    max_val_origins: int,
-    predict_fn: Callable[..., tuple[float, Any]],
-) -> float:
-    candidates = support_val_candidates(bundle, val_idx, seed, max_val_origins)
-    if not candidates:
-        return float("nan")
-
-    predictions = [
-        predict_fn(model, bundle, row_id, t_obs, t_target)[0]
-        for row_id, t_obs, t_target in candidates
-    ]
-    return rmse_from_predictions(predictions, targets_for_candidates(bundle, candidates))
 
 
 def evaluate_paired_rollout_val_rmse(

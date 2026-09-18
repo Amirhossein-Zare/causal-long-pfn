@@ -1,8 +1,4 @@
-"""Semi-QSP-lite Warfarin benchmark generator for CausalLongPFN evaluation.
-
-This generator preserves PK/PD dynamics, gamma-controlled behavioral policy,
-one-step counterfactual rows, and 5-step random-trajectory rows.
-"""
+"""Warfarin benchmark generator."""
 
 from __future__ import annotations
 
@@ -15,17 +11,18 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from .common import concat_raw, ensure_output_dir, save_pickle, standardize_pickle_map, take_rows
+from .common import ensure_output_dir, save_pickle, standardize_pickle_map, write_dataset_manifest
 
 LOGGER = logging.getLogger(__name__)
 
 
 @dataclasses.dataclass
 class WarfarinGeneratorConfig:
-    output_dir: str = "outputs/data/warfarin"
-    gammas: tuple[int, ...] = (1, 2, 3, 4, 5, 6, 7, 8, 9, 10)
+    output_dir: str = "outputs/benchmarks/warfarin"
+    overwrite: bool = False
+    gammas: tuple[int, ...] = (1, 3, 5, 7, 9)
     support_sizes: tuple[int, ...] = (40, 80, 160, 320, 500)
-    reps_per_cell: int = 2
+    reps_per_cell: int = 1
     test_base_patients: int = 1
     seq_length: int = 60
     projection_horizon: int = 5
@@ -34,28 +31,42 @@ class WarfarinGeneratorConfig:
     base_seed: int = 2000
 
     @classmethod
-    def from_dict(cls, values: dict[str, Any] | None = None, **overrides: Any) -> "WarfarinGeneratorConfig":
+    def from_dict(cls, values: dict[str, Any] | None = None) -> "WarfarinGeneratorConfig":
         values = dict(values or {})
-        values.update({k: v for k, v in overrides.items() if v is not None})
         valid = {field.name for field in dataclasses.fields(cls)}
-        return cls(**{k: v for k, v in values.items() if k in valid})
+        unknown = sorted(set(values) - valid)
+        if unknown:
+            raise KeyError(f"Unknown warfarin generator configuration keys: {unknown}")
+        return cls(**values)
 
     def __post_init__(self) -> None:
         self.gammas = tuple(int(x) for x in self.gammas)
         self.support_sizes = tuple(int(x) for x in self.support_sizes)
         if self.n_seq_random_trajectories is None:
             self.n_seq_random_trajectories = int(self.projection_horizon) * 2
+        if not self.gammas or any(gamma < 0 for gamma in self.gammas):
+            raise ValueError("gammas must contain non-negative values.")
+        if not self.support_sizes or any(size < 1 for size in self.support_sizes):
+            raise ValueError("support_sizes must contain positive values.")
+        if self.reps_per_cell < 1 or self.test_base_patients < 1:
+            raise ValueError("reps_per_cell and test_base_patients must be positive.")
+        if self.seq_length < 2 or self.projection_horizon < 1:
+            raise ValueError("seq_length must exceed one and projection_horizon must be positive.")
+        if not 1 <= self.min_t_obs < self.seq_length:
+            raise ValueError("min_t_obs must be within the generated sequence.")
+        if self.projection_horizon >= self.seq_length - self.min_t_obs:
+            raise ValueError("The sequence must contain a complete projection after min_t_obs.")
+        if self.n_seq_random_trajectories < 1:
+            raise ValueError("n_seq_random_trajectories must be positive.")
 
 
-# ============================================================
 # Config
-# ============================================================
 
-OUTPUT_DIR = "outputs/data/warfarin"
+OUTPUT_DIR = "outputs/benchmarks/warfarin"
 
-GAMMAS = [1,2,3,4,5,6,7,8,9,10]
+GAMMAS = [1, 3, 5, 7, 9]
 SUPPORT_SIZES = [40, 80, 160, 320, 500]
-REPS_PER_CELL = 2
+REPS_PER_CELL = 1
 
 TEST_BASE_PATIENTS = 1
 
@@ -80,9 +91,7 @@ INR_LOWER = 2.0
 INR_UPPER = 3.0
 INR_TARGET = 2.5
 
-# ============================================================
 # Utilities
-# ============================================================
 
 def softmax(x):
     x = x - np.max(x)
@@ -149,9 +158,7 @@ def get_scaling_params(sim):
 
     return pd.Series(means), pd.Series(stds)
 
-# ============================================================
 # Warfarin patient simulator
-# ============================================================
 
 class WarfarinLitePatient:
     """
@@ -427,9 +434,7 @@ class WarfarinLitePatient:
 
         st["inr"] = self.compute_inr(st["fii"], st["fvii"], st["fx"])
 
-# ============================================================
 # Simulation routines
-# ============================================================
 
 def simulate_factual_patient(patient, seq_length):
     exog = patient.sample_exogenous_paths(seq_length)
@@ -499,6 +504,7 @@ def simulate_one_step_counterfactual_rows(num_patients, gamma, seq_length, min_t
     sequence_lengths = np.zeros(max_rows, dtype=np.int64)
     patient_ids = np.zeros(max_rows, dtype=np.int64)
     patient_current_t = np.zeros(max_rows, dtype=np.int64)
+    is_factual = np.zeros(max_rows, dtype=bool)
 
     cyp_proxy = np.zeros(max_rows, dtype=np.float32)
     vkorc1_proxy = np.zeros(max_rows, dtype=np.float32)
@@ -531,6 +537,7 @@ def simulate_one_step_counterfactual_rows(num_patients, gamma, seq_length, min_t
                 sequence_lengths[row] = t + 1
                 patient_ids[row] = pid
                 patient_current_t[row] = t
+                is_factual[row] = action == int(factual_actions[t])
 
                 cyp_proxy[row] = pt.cyp_proxy
                 vkorc1_proxy[row] = pt.vkorc1_proxy
@@ -546,6 +553,7 @@ def simulate_one_step_counterfactual_rows(num_patients, gamma, seq_length, min_t
         "sequence_lengths": sequence_lengths[:row],
         "patient_ids_all_trajectories": patient_ids[:row],
         "patient_current_t": patient_current_t[:row],
+        "is_factual": is_factual[:row],
         "cyp_proxy": cyp_proxy[:row],
         "vkorc1_proxy": vkorc1_proxy[:row],
         "age_norm": age_norm[:row],
@@ -663,9 +671,7 @@ def simulate_sequence_counterfactual_rows(
         "maint_need_mg_day": maint_need_mg_day[:row],
     }
 
-# ============================================================
 # Valid-data wrappers
-# ============================================================
 
 def make_support_data(support_size, gamma):
     raw = simulate_factual_dataset(
@@ -673,64 +679,37 @@ def make_support_data(support_size, gamma):
         gamma=gamma,
         seq_length=SEQ_LENGTH,
     )
-
-    keep = np.where(raw["sequence_lengths"] >= MIN_T_OBS)[0]
-    raw = take_rows(raw, keep)
-
-    if raw["states"].shape[0] < support_size:
-        chunks = [raw]
-        n_kept = raw["states"].shape[0]
-
-        while n_kept < support_size:
-            extra = simulate_factual_dataset(
-                num_patients=max(support_size, 50),
-                gamma=gamma,
-                seq_length=SEQ_LENGTH,
-            )
-            keep = np.where(extra["sequence_lengths"] >= MIN_T_OBS)[0]
-            extra = take_rows(extra, keep)
-            chunks.append(extra)
-            n_kept += extra["states"].shape[0]
-
-        raw = concat_raw(chunks)
-
-    return take_rows(raw, np.arange(support_size))
+    if np.any(raw["sequence_lengths"] < MIN_T_OBS):
+        raise ValueError("Warfarin support simulation produced an incomplete trajectory.")
+    return raw
 
 
-def make_valid_one_step_test_data(gamma, max_attempts=100):
-    for attempt in range(max_attempts):
-        raw = simulate_one_step_counterfactual_rows(
-            num_patients=TEST_BASE_PATIENTS,
-            gamma=gamma,
-            seq_length=SEQ_LENGTH,
-            min_tobs=MIN_T_OBS,
-        )
-
-        if raw["states"].shape[0] > 0:
-            return raw, attempt + 1
-
-    raise RuntimeError(f"Could not generate non-empty one-step warfarin test data for gamma={gamma}.")
+def make_one_step_test_data(gamma):
+    raw = simulate_one_step_counterfactual_rows(
+        num_patients=TEST_BASE_PATIENTS,
+        gamma=gamma,
+        seq_length=SEQ_LENGTH,
+        min_tobs=MIN_T_OBS,
+    )
+    if raw["states"].shape[0] == 0:
+        raise RuntimeError(f"Warfarin one-step query construction produced no rows for gamma={gamma}.")
+    return raw
 
 
-def make_valid_seq_test_data(gamma, max_attempts=100):
-    for attempt in range(max_attempts):
-        raw = simulate_sequence_counterfactual_rows(
-            num_patients=TEST_BASE_PATIENTS,
-            gamma=gamma,
-            seq_length=SEQ_LENGTH,
-            projection_horizon=PROJECTION_HORIZON,
-            min_tobs=MIN_T_OBS,
-            n_random_trajectories=N_SEQ_RANDOM_TRAJECTORIES,
-        )
+def make_sequence_test_data(gamma):
+    raw = simulate_sequence_counterfactual_rows(
+        num_patients=TEST_BASE_PATIENTS,
+        gamma=gamma,
+        seq_length=SEQ_LENGTH,
+        projection_horizon=PROJECTION_HORIZON,
+        min_tobs=MIN_T_OBS,
+        n_random_trajectories=N_SEQ_RANDOM_TRAJECTORIES,
+    )
+    if raw["states"].shape[0] == 0:
+        raise RuntimeError(f"Warfarin sequence query construction produced no rows for gamma={gamma}.")
+    return raw
 
-        if raw["states"].shape[0] > 0:
-            return raw, attempt + 1
-
-    raise RuntimeError(f"Could not generate non-empty sequence warfarin test data for gamma={gamma}.")
-
-# ============================================================
 # Dataset assembly
-# ============================================================
 
 def make_dataset(dataset_id, gamma, support_size, rep, seed):
     np.random.seed(seed)
@@ -752,11 +731,11 @@ def make_dataset(dataset_id, gamma, support_size, rep, seed):
         gamma=gamma,
     )
 
-    test_data_counterfactuals, one_step_attempts = make_valid_one_step_test_data(
+    test_data_counterfactuals = make_one_step_test_data(
         gamma=gamma,
     )
 
-    test_data_seq, seq_attempts = make_valid_seq_test_data(
+    test_data_seq = make_sequence_test_data(
         gamma=gamma,
     )
 
@@ -798,9 +777,6 @@ def make_dataset(dataset_id, gamma, support_size, rep, seed):
         "dose_mg_bin": DOSE_MG_BIN.copy(),
         "bin_hours": float(BIN_HOURS),
 
-        "test_one_step_resample_attempts": int(one_step_attempts),
-        "test_seq_resample_attempts": int(seq_attempts),
-
         "support_data": support_data,
 
         "test_data": test_data_counterfactuals,
@@ -823,10 +799,8 @@ def make_dataset(dataset_id, gamma, support_size, rep, seed):
 
 
 
-def generate(config: WarfarinGeneratorConfig | None = None, **overrides: Any) -> pd.DataFrame:
-    config = config or WarfarinGeneratorConfig()
-    if overrides:
-        config = WarfarinGeneratorConfig.from_dict(dataclasses.asdict(config), **overrides)
+def generate(config: WarfarinGeneratorConfig | None = None) -> pd.DataFrame:
+    config = WarfarinGeneratorConfig() if config is None else config
 
     global OUTPUT_DIR, GAMMAS, SUPPORT_SIZES, REPS_PER_CELL
     global TEST_BASE_PATIENTS, SEQ_LENGTH, PROJECTION_HORIZON, N_SEQ_RANDOM_TRAJECTORIES
@@ -843,11 +817,7 @@ def generate(config: WarfarinGeneratorConfig | None = None, **overrides: Any) ->
     MIN_T_OBS = int(config.min_t_obs)
     BASE_SEED = int(config.base_seed)
 
-    output_dir = ensure_output_dir(OUTPUT_DIR)
-    # ============================================================
-    # Generate datasets
-    # ============================================================
-
+    output_dir = ensure_output_dir(OUTPUT_DIR, overwrite=bool(config.overwrite))
     summary_rows = []
     dataset_id = 0
 
@@ -876,6 +846,7 @@ def generate(config: WarfarinGeneratorConfig | None = None, **overrides: Any) ->
 
                 file_path = output_dir / file_name
                 save_pickle(pickle_map, file_path)
+                write_dataset_manifest(pickle_map, file_path, generator_config=dataclasses.asdict(config), generator_source=__file__)
 
                 one_step_rows = pickle_map["test_data"]["states"].shape[0]
                 seq_rows = pickle_map["test_data_seq"]["states"].shape[0]
@@ -903,8 +874,6 @@ def generate(config: WarfarinGeneratorConfig | None = None, **overrides: Any) ->
                     "test_data_rows_one_step_counterfactual": one_step_rows,
                     "test_data_seq_rows_multi_step_counterfactual": seq_rows,
 
-                    "test_one_step_resample_attempts": pickle_map["test_one_step_resample_attempts"],
-                    "test_seq_resample_attempts": pickle_map["test_seq_resample_attempts"],
 
                     "min_t_obs": MIN_T_OBS,
                     "seq_length": SEQ_LENGTH,

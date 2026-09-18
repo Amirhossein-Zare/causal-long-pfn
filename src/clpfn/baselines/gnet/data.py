@@ -4,12 +4,13 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from clpfn.baselines.common.features import encode_actions
 from clpfn.baselines.common.training import move_float_batch_to_device
 from clpfn.evaluation.core import benchmark as common
 
 
 class GNetSupportDataset(Dataset):
-    def __init__(self, bundle, context_idx):
+    def __init__(self, bundle, context_idx, *, has_vitals: bool = True, treatment_mode: str = "multiclass"):
         idx = np.asarray(context_idx, dtype=np.int64)
 
         C = bundle["covariates"][idx]
@@ -24,19 +25,27 @@ class GNetSupportDataset(Dataset):
         A = A[:, :T]
 
         T_train = max(1, T - 1)
+        n = int(idx.size)
+        d_vitals = int(C.shape[-1]) if has_vitals else 0
 
-        self.current_treatments = common.action_onehot_2d(A[:, :T_train], common.N_ACTIONS).astype(np.float32)
-        self.vitals = C[:, :T_train, :].astype(np.float32)
+        self.current_treatments = encode_actions(A[:, :T_train], treatment_mode).astype(np.float32)
+        self.vitals = (
+            C[:, :T_train, :].astype(np.float32)
+            if has_vitals
+            else np.zeros((n, T_train, 0), dtype=np.float32)
+        )
         self.prev_outputs = Yc[:, :T_train, None].astype(np.float32)
         self.static_features = S.astype(np.float32)
-
         self.outputs = Yc[:, 1:T_train + 1, None].astype(np.float32)
 
-        next_vitals_full = C[:, 1:T_train + 1, :].astype(np.float32)
-        self.next_vitals = next_vitals_full[:, :-1, :].astype(np.float32)
+        if has_vitals:
+            next_vitals_full = C[:, 1:T_train + 1, :].astype(np.float32)
+            self.next_vitals = next_vitals_full[:, :-1, :].astype(np.float32)
+        else:
+            self.next_vitals = np.zeros((n, max(0, T_train - 1), d_vitals), dtype=np.float32)
 
         t_grid = np.arange(T_train)[None, :]
-        active = ((t_grid + 1) < L[:, None]).astype(np.float32)[:, :, None]
+        active = ((t_grid + 1) <= L[:, None]).astype(np.float32)[:, :, None]
         active *= np.isfinite(self.outputs).astype(np.float32)
 
         keep = active.sum(axis=(1, 2)) > 0
@@ -48,6 +57,8 @@ class GNetSupportDataset(Dataset):
         self.outputs = self.outputs[keep]
         self.next_vitals = self.next_vitals[keep]
         self.active_entries = active[keep].astype(np.float32)
+        self.sequence_lengths = np.maximum(0, self.active_entries[:, :, 0].sum(axis=1).astype(np.int64))
+        self.has_vitals = bool(has_vitals)
 
         if self.current_treatments.shape[0] == 0:
             raise ValueError("No active support sequences available for GNet training.")

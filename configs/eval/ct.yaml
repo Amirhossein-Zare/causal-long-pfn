@@ -1,54 +1,95 @@
 method: ct
-
 data:
-  wanted_domains: [cancer, hiv, warfarin, mimic]
+  wanted_domains:
+  - cancer
+  - hiv
+  - warfarin
+  - mimic
   raw_inputs:
     pickle_dirs:
-      - outputs/data/cancer
-      - outputs/data/hiv
-      - outputs/data/warfarin
-      - outputs/data/mimic
-
+    - outputs/benchmarks/cancer
+    - outputs/benchmarks/hiv
+    - outputs/benchmarks/warfarin
+    - outputs/benchmarks/mimic
 evaluation:
   output_dir: outputs/eval/ct
-
+  query_seed: 4242
 tuning:
   initial_random_search: 40
-  top_k_reuse: 1
-
+  state_dir: outputs/tuning_state/ct
+  plan_seed: 1701
+  split_seed: 2701
+  train_seed: 3701
+  validation_seed: 4701
+fitting:
+  fit_root: outputs/fits
+  final_fit_seed: 101
 baseline:
   limits:
-    max_val_origins: 256
+    max_val_origins: 512
     eval_batch_size: 128
-
   default_hparams:
-    ct_epochs: 80
-    batch_size: 64
-    lr: 1.0e-3
-    weight_decay: 1.0e-5
-    optimizer_cls: adamw
-    seq_hidden_units: 64
-    br_size: 64
-    fc_hidden_units: 64
-    num_layers: 2
-    num_heads: 4
-    dropout: 0.10
+    ct_epochs: 150
+    batch_size: 128
+    lr: 0.001
+    weight_decay: 0.0
+    optimizer_cls: adam
+    seq_hidden_units: 16
+    br_size: 12
+    fc_hidden_units: 24
+    num_layers: 1
+    num_heads: 2
+    dropout: 0.1
     max_position_len: 65
-    grl_alpha: 0.10
-    treatment_loss_weight: 0.20
+    max_relative_position: 15
+    trainable_positional_encoding: true
+    balancing: domain_confusion
+    alpha_max: 0.01
+    update_alpha: true
+    alpha_schedule: sigmoid
+    weights_ema: true
+    ema_beta: 0.99
     grad_clip: 1.0
-    augment_with_masked_vitals: false
-
+    augment_with_masked_vitals: true
   search_space:
-    num_layers: [2, 3, 4]
-    num_heads: [2, 4]
-    seq_hidden_units: [64, 96, 128]
-    br_size: [64, 96, 128]
-    fc_hidden_units: [64, 96, 128]
-    dropout: [0.05, 0.10, 0.20]
-    lr: [1.0e-3, 3.0e-4, 1.0e-4]
-    weight_decay: [1.0e-5, 1.0e-4, 1.0e-3]
-    batch_size: [32, 64]
-    grad_clip: [0.5, 1.0]
-    treatment_loss_weight: [0.05, 0.10, 0.20]
-    augment_with_masked_vitals: [false]
+    num_layers:
+    - 1
+    num_heads:
+    - 2
+    seq_hidden_multiplier:
+    - 1.0
+    - 2.0
+    - 3.0
+    - 4.0
+    br_multiplier:
+    - 0.5
+    - 1.0
+    - 2.0
+    - 3.0
+    - 4.0
+    fc_hidden_multiplier:
+    - 0.5
+    - 1.0
+    - 2.0
+    - 3.0
+    - 4.0
+    dropout:
+    - 0.1
+    - 0.2
+    - 0.3
+    - 0.4
+    - 0.5
+    lr:
+    - 0.01
+    - 0.001
+    - 0.0001
+    batch_size:
+    - 64
+    - 128
+    - 256
+    grad_clip:
+    - 1.0
+    ct_epochs:
+    - 150
+execution:
+  mode: tune

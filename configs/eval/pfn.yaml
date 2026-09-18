@@ -4,22 +4,22 @@ data:
   wanted_domains: [cancer, hiv, warfarin, mimic]
   raw_inputs:
     pickle_dirs:
-      - outputs/data/cancer
-      - outputs/data/hiv
-      - outputs/data/warfarin
-      - outputs/data/mimic
+      - outputs/benchmarks/cancer
+      - outputs/benchmarks/hiv
+      - outputs/benchmarks/warfarin
+      - outputs/benchmarks/mimic
   ready_inputs:
     ready_dirs:
-      - outputs/pfn_ready/all_domains
+      - outputs/pfn_ready
 
 ready_builder:
   pfn_max_context: 500
-  max_test_rows_per_task: null
-  output_dir: outputs/pfn_ready/all_domains
+  output_dir: outputs/pfn_ready
+  ready_build_id: causal_long_pfn_ready_seed_2026
+  overwrite: false
   seed: 2026
 
 evaluation:
-  output_dir: outputs/eval/causal_long_pfn
-  checkpoint_path: null
+  output_dir: outputs/paper_evaluations/causal_long_pfn/seed_42
   batch_size: 32
   report_calibration: true

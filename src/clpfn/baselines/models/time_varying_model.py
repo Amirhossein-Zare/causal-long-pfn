@@ -36,7 +36,7 @@ class TimeVaryingCausalModel(nn.Module):
     """
     Base class for time-varying causal models.
 
-    This provides the pieces used by GNet/RMSN/CRN ports:
+    This provides the pieces used by GNet/RMSN ports:
       - hparams storage
       - model dimensions
       - optimizer construction
@@ -221,7 +221,11 @@ class TimeVaryingCausalModel(nn.Module):
         outputs = dataset.data["outputs"]
         active_entries = dataset.data["active_entries"]
         if one_step_counterfactual:
-            active_entries = dataset.data.get("active_entries", active_entries)
+            num_samples, _, output_dim = active_entries.shape
+            active_entries = active_entries - np.concatenate(
+                [active_entries[:, 1:, :], np.zeros((num_samples, 1, output_dim))],
+                axis=1,
+            )
         mse = (active_entries * (outcome_pred - outputs) ** 2).sum() / active_entries.sum()
         return float(np.sqrt(mse))
 
@@ -265,7 +269,7 @@ class BRCausalModel(TimeVaryingCausalModel):
             weights = []
             for treatment_idx in range(self.dim_treatments):
                 positives = ((labels == treatment_idx) * active_entries.squeeze(-1)).sum()
-                weights.append(active_entries.sum() / max(float(positives), 1.0))
+                weights.append(active_entries.sum() / (max(float(positives), 1.0) * self.dim_treatments))
             self.bce_weights = np.asarray(weights, dtype=np.float32)
         else:
             raise NotImplementedError()

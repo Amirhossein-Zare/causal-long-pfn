@@ -1,61 +1,174 @@
 method: rmsn
-
 data:
-  wanted_domains: [cancer, hiv, warfarin, mimic]
+  wanted_domains:
+  - cancer
+  - hiv
+  - warfarin
+  - mimic
   raw_inputs:
     pickle_dirs:
-      - outputs/data/cancer
-      - outputs/data/hiv
-      - outputs/data/warfarin
-      - outputs/data/mimic
-
+    - outputs/benchmarks/cancer
+    - outputs/benchmarks/hiv
+    - outputs/benchmarks/warfarin
+    - outputs/benchmarks/mimic
 evaluation:
   output_dir: outputs/eval/rmsn
-
+  query_seed: 4242
 tuning:
   initial_random_search: 40
-  top_k_reuse: 1
-
+  state_dir: outputs/tuning_state/rmsn
+  plan_seed: 1701
+  split_seed: 2701
+  train_seed: 3701
+  validation_seed: 4701
+fitting:
+  fit_root: outputs/fits
+  final_fit_seed: 101
 baseline:
+  stagewise_tuning:
+    propensity_treatment_trials: 40
+    propensity_history_trials: 40
+    encoder_trials: 40
+    decoder_trials: 25
+  treatment_mode_by_domain:
+    cancer: multilabel
+    hiv: multiclass
+    warfarin: multiclass
+    mimic: multilabel
   limits:
-    n_action_bits: 2
-    max_train_origins: 6000
-    max_val_origins: 256
-    prop_batch_size: 128
-    encoder_batch_size: 128
-    decoder_batch_size: 256
-
+    n_actions: 4
+    max_val_origins: 512
   default_hparams:
+    hidden_units_propensity_treatment: 32
+    hidden_units_propensity_history: 64
     hidden_units_encoder: 64
     hidden_units_decoder: 64
-    num_layers: 1
-    dropout: 0.10
-    propensity_epochs: 30
-    encoder_epochs: 80
+    num_layers_propensity_treatment: 1
+    num_layers_propensity_history: 1
+    num_layers_encoder: 1
+    num_layers_decoder: 1
+    dropout_propensity_treatment: 0.1
+    dropout_propensity_history: 0.1
+    dropout_encoder: 0.1
+    dropout_decoder: 0.1
+    propensity_epochs: 100
+    encoder_epochs: 100
     decoder_epochs: 100
-    lr_prop: 1.0e-3
-    lr_enc: 2.0e-3
-    lr_dec: 2.0e-3
+    lr_propensity_treatment: 0.001
+    lr_propensity_history: 0.001
+    lr_encoder: 0.001
+    lr_decoder: 0.001
+    batch_size_propensity_treatment: 128
+    batch_size_propensity_history: 128
     batch_size_encoder: 128
     batch_size_decoder: 256
-    weight_decay: 1.0e-5
-    optimizer_cls: adamw
-    max_grad_norm: 1.0
-    weight_clip_quantiles: [0.01, 0.99]
-
+    max_grad_norm_propensity_treatment: 1.0
+    max_grad_norm_propensity_history: 1.0
+    max_grad_norm_encoder: 1.0
+    max_grad_norm_decoder: 1.0
+    weight_decay: 0.0
+    optimizer_cls: adam
+    weight_clip_quantiles:
+    - 0.01
+    - 0.99
   search_space:
-    num_layers: [1, 2]
-    dropout: [0.1, 0.2, 0.3, 0.4, 0.5]
-    lr_prop: [1.0e-2, 1.0e-3, 1.0e-4]
-    lr_enc: [1.0e-2, 1.0e-3, 1.0e-4]
-    lr_dec: [1.0e-2, 1.0e-3, 1.0e-4]
-    batch_size_encoder: [64, 128, 256]
-    batch_size_decoder: [256, 512, 1024]
-    max_grad_norm: [0.5, 1.0, 2.0, 4.0]
-
+    num_layers_propensity_treatment:
+    - 1
+    num_layers_propensity_history:
+    - 1
+    num_layers_encoder:
+    - 1
+    num_layers_decoder:
+    - 1
+    dropout_propensity_treatment:
+    - 0.1
+    - 0.2
+    - 0.3
+    - 0.4
+    - 0.5
+    dropout_propensity_history:
+    - 0.1
+    - 0.2
+    - 0.3
+    - 0.4
+    - 0.5
+    dropout_encoder:
+    - 0.1
+    - 0.2
+    - 0.3
+    - 0.4
+    - 0.5
+    dropout_decoder:
+    - 0.1
+    - 0.2
+    - 0.3
+    - 0.4
+    - 0.5
+    lr_propensity_treatment:
+    - 0.01
+    - 0.001
+    - 0.0001
+    lr_propensity_history:
+    - 0.01
+    - 0.001
+    - 0.0001
+    lr_encoder:
+    - 0.01
+    - 0.001
+    - 0.0001
+    lr_decoder:
+    - 0.01
+    - 0.001
+    - 0.0001
+    batch_size_propensity_treatment:
+    - 64
+    - 128
+    - 256
+    batch_size_propensity_history:
+    - 64
+    - 128
+    - 256
+    batch_size_encoder:
+    - 64
+    - 128
+    - 256
+    batch_size_decoder:
+    - 256
+    - 512
+    - 1024
+    max_grad_norm_propensity_treatment:
+    - 0.5
+    - 1.0
+    - 2.0
+    max_grad_norm_propensity_history:
+    - 0.5
+    - 1.0
+    - 2.0
+    max_grad_norm_encoder:
+    - 0.5
+    - 1.0
+    - 2.0
+    max_grad_norm_decoder:
+    - 0.5
+    - 1.0
+    - 2.0
+    - 4.0
   scaled_space:
-    width_multipliers: [0.5, 1.0, 2.0, 4.0]
-    min_width: 32
+    width_multipliers:
+    - 0.5
+    - 1.0
+    - 2.0
+    - 3.0
+    - 4.0
+    decoder_width_multipliers:
+    - 1.0
+    - 2.0
+    - 4.0
+    - 8.0
+    - 16.0
+    min_width: 2
     max_width: 160
-    width_multiple: 16
-    practical_widths: [32, 48, 64, 96, 128]
+    width_multiple: 1
+    practical_widths: []
+execution:
+  mode: tune

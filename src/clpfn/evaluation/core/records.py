@@ -2,11 +2,6 @@ from __future__ import annotations
 
 from typing import Any
 
-import numpy as np
-
-from clpfn.evaluation.core import benchmark as common
-from clpfn.evaluation.core.tasks import task_step_from_task_and_tau
-
 
 REQUIRED_PREDICTION_COLUMNS = (
     "method",
@@ -23,6 +18,7 @@ REQUIRED_PREDICTION_COLUMNS = (
     "task_name",
     "task_step",
     "tau",
+    "horizon",
     "t_obs",
     "t_target",
     "pred_norm",
@@ -62,7 +58,9 @@ def _base_prediction_record(
 ) -> dict[str, Any]:
     t_obs = int(t_obs)
     t_target = int(t_target)
-    tau = int(max(1, t_target - t_obs))
+    if t_target <= t_obs:
+        raise ValueError(f"Expected t_target > t_obs, got {t_obs} and {t_target}.")
+    tau = int(t_target - t_obs)
     pred_norm = float(pred_norm)
     target_norm = float(target_norm)
     error_norm = pred_norm - target_norm
@@ -80,8 +78,9 @@ def _base_prediction_record(
         "gamma": gamma,
         "support_size": int(support_size),
         "task_name": str(task_name),
-        "task_step": task_step_from_task_and_tau(task_name, tau),
+        "task_step": task_name,
         "tau": int(tau),
+        "horizon": int(tau),
         "t_obs": int(t_obs),
         "t_target": int(t_target),
         "pred_norm": pred_norm,
@@ -98,10 +97,11 @@ def _base_prediction_record(
 
 
 def target_norm_from_raw(query_bundle: dict[str, Any], meta: dict[str, Any], row_id: int, t_target: int) -> float:
-    out_std = max(float(meta["out_std"]), 1e-6)
+    out_std = float(meta["out_std"])
+    if out_std <= 0:
+        raise ValueError("Outcome standard deviation must be positive.")
     target_raw = float(query_bundle["y_raw"][int(row_id), int(t_target)])
-    target_norm_unclipped = float((target_raw - float(meta["out_mean"])) / out_std)
-    return float(np.clip(target_norm_unclipped, -common.TARGET_NORM_CLIP, common.TARGET_NORM_CLIP))
+    return float((target_raw - float(meta["out_mean"])) / out_std)
 
 
 def make_raw_prediction_record(
@@ -130,7 +130,7 @@ def make_raw_prediction_record(
         source_file=str(meta["source_file"]),
         row_id=int(row_id),
         query_id=int(query_id),
-        gamma=meta.get("gamma", np.nan),
+        gamma=meta["gamma"],
         support_size=int(meta["support_size"]),
         task_name=task_name,
         t_obs=int(current_t),
@@ -143,20 +143,16 @@ def make_raw_prediction_record(
 
 
 def ready_map_meta(ready_map: dict[str, Any]) -> dict[str, Any]:
-    ready_file_value = (
-        ready_map["_ready_file_basename"]
-        if "_ready_file_basename" in ready_map
-        else _required(ready_map, "ready_file")
-    )
-    ready_file_basename = str(ready_file_value)
+    ready_file_basename = str(_required(ready_map, "_ready_file_basename"))
     source_file = str(_required(ready_map, "source_file"))
     return {
+        "dataset_uid": str(_required(ready_map, "dataset_uid")),
         "domain": str(_required(ready_map, "domain")).lower(),
         "dataset_id": int(_required(ready_map, "dataset_id")),
         "global_dataset_id": int(_required(ready_map, "global_dataset_id")),
         "source_file": source_file,
         "ready_file": ready_file_basename,
-        "gamma": ready_map.get("gamma", np.nan),
+        "gamma": _required(ready_map, "gamma"),
         "support_size": int(_required(ready_map, "support_size")),
     }
 
@@ -181,7 +177,7 @@ def make_ready_prediction_record(
     meta = ready_map_meta(ready_map)
     t_obs = int(t_obs)
     t_target = int(t_target)
-    tau = int(max(1, tau))
+    tau = int(tau)
     if t_target <= t_obs:
         raise ValueError(f"Expected t_target > t_obs, got t_obs={t_obs}, t_target={t_target}.")
     if tau != t_target - t_obs:

@@ -5,6 +5,10 @@ from clpfn.config.defaults import (
     D_STATIC_MAX,
     D_STATE_MIN,
     D_STATE_MAX,
+    ENABLE_CONFOUNDING,
+    ENABLE_EXPLICIT_DELAYED_TREATMENT_EFFECTS,
+    ENABLE_LATENT_HETEROGENEITY,
+    ENABLE_MOTIFS,
     HIDDEN_SENTINEL,
     HORIZON_MAX,
     HORIZON_MIN,
@@ -18,7 +22,6 @@ from clpfn.config.defaults import (
     OBS_TIME_MAX,
     OBS_TIME_MIN,
     SUPPORT_FUTURE_COVARIATE_MASK_PROB,
-    SUPPORT_LABEL_NOISE_PROB,
 )
 
 
@@ -126,7 +129,7 @@ class TSCMEpisodeGenerator:
         ]
 
         weight_scale = float(rng.uniform(0.3, 1.0))
-        primary_mechanism = self._sample_mechanism(
+        mechanism = self._sample_mechanism(
             d_state=d_state,
             lag_order=lag_order,
             instantaneous_graph=instantaneous_graph,
@@ -179,21 +182,6 @@ class TSCMEpisodeGenerator:
         latent_initial_state_loading = (
             rng.standard_normal((d_state, LATENT_UNIT_DIM)).astype(np.float32) * initial_state_loading_scale
         )
-
-        regime_switch_config = None
-        if rng.random() < 0.12:
-            secondary_mechanism = self._sample_mechanism(
-                d_state=d_state,
-                lag_order=lag_order,
-                instantaneous_graph=instantaneous_graph,
-                lagged_graphs=lagged_graphs,
-                weight_scale=weight_scale,
-            )
-            switch_time = int(rng.integers(OBS_TIME_MIN // 3, 2 * OBS_TIME_MAX // 3 + 1))
-            regime_switch_config = {
-                "switch_time": switch_time,
-                "mechanism": secondary_mechanism,
-            }
 
         use_action_memory_channel = bool(rng.random() < 0.25)
         use_saturating_channel = bool(rng.random() < 0.25)
@@ -335,7 +323,8 @@ class TSCMEpisodeGenerator:
 
         outcome_ar_coeff = float(rng.uniform(0.35, 0.90))
         outcome_state_gain = float(rng.uniform(0.35, 1.20))
-        outcome_action_weights = rng.normal(0.0, 0.25, size=2).astype(np.float32)
+        outcome_action_weights_base = rng.normal(0.0, 0.25, size=2).astype(np.float32)
+        outcome_action_weights = outcome_action_weights_base.copy()
 
         if has_any_motif:
             outcome_action_weights += rng.normal(0.0, 0.25, size=2).astype(np.float32)
@@ -360,10 +349,10 @@ class TSCMEpisodeGenerator:
             if len(indices) > 0:
                 motif_coordinate_mask[indices] = True
 
-        return {
+        tscm = {
             "d_state": d_state,
             "lag_order": lag_order,
-            "primary_mechanism": primary_mechanism,
+            "mechanism": mechanism,
             "state_ar_coeff": state_ar_coeff,
             "state_noise_family": state_noise_family,
             "state_noise_scale": state_noise_scale,
@@ -382,7 +371,6 @@ class TSCMEpisodeGenerator:
             "latent_policy_loading_bit0": latent_policy_loading_bit0,
             "latent_policy_loading_bit1": latent_policy_loading_bit1,
             "latent_initial_state_loading": latent_initial_state_loading,
-            "regime_switch_config": regime_switch_config,
             "action_memory_indices": action_memory_indices,
             "saturating_indices": saturating_indices,
             "homeostatic_indices": homeostatic_indices,
@@ -411,10 +399,67 @@ class TSCMEpisodeGenerator:
             "outcome_ar_coeff": outcome_ar_coeff,
             "outcome_state_gain": outcome_state_gain,
             "outcome_action_weights": outcome_action_weights,
+            "outcome_action_weights_base": outcome_action_weights_base,
             "outcome_action_memory_weights": outcome_action_memory_weights,
             "outcome_noise_scale": outcome_noise_scale,
             "outcome_trend": outcome_trend,
         }
+
+        return self._apply_configured_ablation(tscm)
+
+    @staticmethod
+    def _empty_indices() -> np.ndarray:
+        return np.array([], dtype=np.int32)
+
+    def _apply_configured_ablation(self, tscm: dict) -> dict:
+        """Apply configured prior ablations after sampling the full TSCM.
+
+        Applying removals after the complete draw keeps the random-number stream
+        aligned with the full-prior run for the same episode seed whenever the
+        episode-mode ablation itself does not change later simulation branches.
+        """
+        if not ENABLE_LATENT_HETEROGENEITY:
+            tscm["latent_policy_loading_bit0"] = np.zeros_like(tscm["latent_policy_loading_bit0"])
+            tscm["latent_policy_loading_bit1"] = np.zeros_like(tscm["latent_policy_loading_bit1"])
+            tscm["latent_initial_state_loading"] = np.zeros_like(tscm["latent_initial_state_loading"])
+
+        if not ENABLE_CONFOUNDING:
+            # Make the behavior policy independent of prognostic state and
+            # latent unit heterogeneity while retaining marginal treatment
+            # prevalence and treatment persistence through policy biases and
+            # action-history memory. This removes both measured-state and
+            # latent treatment-outcome confounding from the sampled prior.
+            tscm["policy_state_weights_bit0"] = np.zeros_like(tscm["policy_state_weights_bit0"])
+            tscm["policy_state_weights_bit1"] = np.zeros_like(tscm["policy_state_weights_bit1"])
+            tscm["latent_policy_loading_bit0"] = np.zeros_like(tscm["latent_policy_loading_bit0"])
+            tscm["latent_policy_loading_bit1"] = np.zeros_like(tscm["latent_policy_loading_bit1"])
+
+        if not ENABLE_MOTIFS:
+            for key in (
+                "action_memory_indices",
+                "saturating_indices",
+                "homeostatic_indices",
+                "feedback_indices",
+                "readout_indices",
+            ):
+                tscm[key] = self._empty_indices()
+            tscm["motif_coordinate_mask"] = np.zeros(tscm["d_state"], dtype=np.bool_)
+            tscm["outcome_action_weights"] = tscm["outcome_action_weights_base"].copy()
+
+        if not ENABLE_EXPLICIT_DELAYED_TREATMENT_EFFECTS:
+            # Retain direct current-action effects in outcome_action_weights, but
+            # remove explicit cumulative action memory and treatment-driven
+            # persistent motif channels. Generic temporal persistence remains.
+            action_memory_indices = np.asarray(tscm["action_memory_indices"], dtype=np.int32)
+            if action_memory_indices.size:
+                tscm["motif_coordinate_mask"][action_memory_indices] = False
+            tscm["action_memory_indices"] = self._empty_indices()
+            tscm["outcome_action_memory_weights"] = np.zeros_like(tscm["outcome_action_memory_weights"])
+            tscm["homeostatic_action_weights"] = np.zeros_like(tscm["homeostatic_action_weights"])
+            tscm["feedback_action_weights"] = np.zeros_like(tscm["feedback_action_weights"])
+            tscm["saturation_signal_weights"] = np.zeros_like(tscm["saturation_signal_weights"])
+
+        return tscm
 
     def _state_readout(self, tscm: dict, state_path: np.ndarray, mix: dict | None = None) -> np.ndarray:
         if tscm["use_state_outcome"]:
@@ -623,12 +668,7 @@ class TSCMEpisodeGenerator:
         d_state = tscm["d_state"]
         lag_order = tscm["lag_order"]
 
-        regime_switch = tscm["regime_switch_config"]
-        mechanism = (
-            regime_switch["mechanism"]
-            if (regime_switch is not None and time_idx >= regime_switch["switch_time"])
-            else tscm["primary_mechanism"]
-        )
+        mechanism = tscm["mechanism"]
 
         previous_state = (
             lag_buffer[0]
@@ -846,11 +886,13 @@ class TSCMEpisodeGenerator:
         continuous_proxy = continuous_proxy / max(continuous_scale, 0.1)
         static[:, 0] = np.clip(continuous_proxy, -3.0, 3.0).astype(np.float32)
 
+        binary_index = 1
+        category_indices = (2, 3)
+
         if D_STATIC_MAX >= 3:
             binary_logit = 0.9 * latent[:, 1] + 0.25 * self.rng.standard_normal(n_units)
             binary_proxy = (binary_logit > 0.0).astype(np.float32)
-            static[:, 1] = binary_proxy
-            static[:, 2] = 1.0 - binary_proxy
+            static[:, binary_index] = binary_proxy
 
         if D_STATIC_MAX >= 5:
             logits = np.stack(
@@ -867,13 +909,12 @@ class TSCMEpisodeGenerator:
             probs = np.exp(logits)
             probs = probs / probs.sum(axis=1, keepdims=True)
 
-            draws = np.array(
-                [self.rng.choice(3, p=probs[i]) for i in range(n_units)],
-                dtype=np.int32,
-            )
+            thresholds = np.cumsum(probs, axis=1)
+            uniform = self.rng.random(n_units)[:, None]
+            draws = (uniform < thresholds).argmax(axis=1).astype(np.int32)
 
-            static[:, 3] = (draws == 0).astype(np.float32)
-            static[:, 4] = (draws == 1).astype(np.float32)
+            static[:, category_indices[0]] = (draws == 0).astype(np.float32)
+            static[:, category_indices[1]] = (draws == 1).astype(np.float32)
 
         return static.astype(np.float32)
 
@@ -898,18 +939,11 @@ class TSCMEpisodeGenerator:
             planned_actions = np.zeros(MAX_SEQ_LEN, dtype=np.int32)
 
             if not is_observational_query:
-                current_plan_time = obs_time
-
-                while current_plan_time < final_target_time:
-                    lo = max(1, horizon // 4)
-                    hi = max(2, horizon // 2)
-                    block_len = int(self.rng.integers(lo, hi))
-
-                    planned_actions[
-                        current_plan_time:min(current_plan_time + block_len, final_target_time)
-                    ] = int(self.rng.integers(0, N_ACTIONS))
-
-                    current_plan_time += block_len
+                planned_actions[obs_time:final_target_time] = self.rng.integers(
+                    0,
+                    N_ACTIONS,
+                    size=final_target_time - obs_time,
+                ).astype(np.int32)
 
             outcome_mix = None
 
@@ -1245,16 +1279,6 @@ class TSCMEpisodeGenerator:
                 anchor_time = int(support_anchor_times_1d[anchor_idx])
                 raw_anchor_y = support_outcome_path[:, anchor_time].copy()
 
-                if anchor_idx == 0 and self.rng.random() < SUPPORT_LABEL_NOISE_PROB:
-                    noise_scale = float(self.rng.choice([0.0, 0.05, 0.10], p=[0.45, 0.30, 0.25]))
-
-                    if noise_scale > 0:
-                        raw_anchor_y = raw_anchor_y + self.rng.normal(
-                            0.0,
-                            noise_scale * support_outcome_std,
-                            size=n_support,
-                        )
-
                 support_anchor_y[:, anchor_idx] = np.clip(
                     (raw_anchor_y - support_outcome_mean) / support_outcome_std,
                     -10.0,
@@ -1280,6 +1304,7 @@ class TSCMEpisodeGenerator:
                 "d_input": d_state + D_OUTCOME,
                 "n_support": n_support,
                 "current_time": current_time,
+                "t_obs": obs_time,
 
                 "support_x": support_x.astype(np.float32),
                 "support_actions": support_actions,

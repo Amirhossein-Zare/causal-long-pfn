@@ -16,7 +16,8 @@ TAU_MAX = 5
 MAX_SEQ_LEN = T_OBS_MAX + TAU_MAX
 MAX_INPUT_INDEX = MAX_SEQ_LEN - 1
 MAX_TARGET_INDEX = MAX_SEQ_LEN
-MIN_T_OBS = 10
+MIN_HISTORY_POINTS = 10
+MIN_T_OBS = MIN_HISTORY_POINTS - 1
 PROJECTION_HORIZON = 5
 
 N_ACTIONS = 4
@@ -25,6 +26,7 @@ D_STATIC_MAX = 5
 TARGET_NORM_CLIP = 10.0
 PRED_CLIP_REPORT = 20.0
 STATE_CLIP_TRAIN = 5.0
+STATIC_CLIP_TRAIN = 3.0
 OUTCOME_CLIP_TRAIN = 10.0
 WANTED_DOMAINS = ("cancer", "hiv", "warfarin", "mimic")
 
@@ -46,9 +48,12 @@ class RawBenchmarkInputs:
     @classmethod
     def from_dict(cls, values: dict[str, Any] | None = None) -> "RawBenchmarkInputs":
         values = dict(values or {})
+        unknown = sorted(set(values) - {"pickle_dirs", "pickle_paths"})
+        if unknown:
+            raise KeyError(f"Unknown raw benchmark input keys: {unknown}")
         return cls(
-            pickle_dirs=tuple(str(path) for path in values.get("pickle_dirs", []) or []),
-            pickle_paths=tuple(str(path) for path in values.get("pickle_paths", []) or []),
+            pickle_dirs=tuple(str(path) for path in values["pickle_dirs"]) if "pickle_dirs" in values else (),
+            pickle_paths=tuple(str(path) for path in values["pickle_paths"]) if "pickle_paths" in values else (),
         )
 
     def validate(self) -> None:
@@ -101,30 +106,6 @@ def stable_file_seed(path):
     return sum((i + 1) * ord(c) for i, c in enumerate(base))
 
 
-def finite_or_zero(x):
-    x = np.asarray(x, dtype=np.float32)
-    x[~np.isfinite(x)] = 0.0
-    return x
-
-
-def fixed_2d_float(arr, rows, cols):
-    arr = np.asarray(arr, dtype=np.float32)
-
-    if arr.ndim == 0:
-        arr = np.zeros((rows, cols), dtype=np.float32)
-
-    if arr.ndim == 1:
-        arr = arr.reshape(1, -1) if rows == 1 else arr.reshape(rows, -1)
-
-    out = np.zeros((rows, cols), dtype=np.float32)
-    n_rows = min(rows, arr.shape[0])
-    n_cols = min(cols, arr.shape[1])
-    out[:n_rows, :n_cols] = arr[:n_rows, :n_cols]
-    out[~np.isfinite(out)] = 0.0
-
-    return out
-
-
 def move_tensor_batch_to_device(batch, device=None, *, float_tensors=False, long_keys=()):
     device = DEVICE if device is None else device
     long_keys = set(long_keys)
@@ -150,20 +131,12 @@ def normalized_rmse_from_sqerr(sqerr):
     return float(np.sqrt(np.mean(sqerr))) if sqerr.size else float("nan")
 
 
-def action_onehot_2d(a_2d, n_actions=N_ACTIONS):
-    a_2d = np.asarray(a_2d, dtype=np.int64)
-    out = np.zeros((a_2d.shape[0], a_2d.shape[1], n_actions), dtype=np.float32)
-    idx = np.clip(a_2d, 0, n_actions - 1)
-
-    for k in range(n_actions):
-        out[:, :, k] = (idx == k).astype(np.float32)
-
-    return out
-
-
 def onehot_action(a, n_actions=N_ACTIONS):
+    action = int(a)
+    if not 0 <= action < n_actions:
+        raise ValueError(f"Action {action} is outside [0, {n_actions - 1}].")
     out = np.zeros(n_actions, dtype=np.float32)
-    out[int(np.clip(a, 0, n_actions - 1))] = 1.0
+    out[action] = 1.0
     return out
 
 
@@ -225,8 +198,6 @@ def get_outcome_array(raw, domain, cfg):
         raise KeyError(f"Raw {domain} data is missing canonical outcome key '{key}'.")
 
     arr = np.asarray(raw[key], dtype=np.float32)
-    if arr.ndim == 3 and arr.shape[-1] == 1:
-        arr = arr[:, :, 0]
     if arr.ndim != 2:
         raise ValueError(f"Raw {domain} canonical outcomes must have shape [N, T], got {arr.shape}.")
 
@@ -239,8 +210,6 @@ def get_actions(raw, domain):
         raise KeyError(f"Raw {domain} data is missing canonical action key '{key}'.")
 
     A = np.asarray(raw[key])
-    if A.ndim == 3 and A.shape[-1] == 1:
-        A = A[:, :, 0]
     if A.ndim != 2:
         raise ValueError(f"Raw {domain} canonical actions must have shape [N, T], got {A.shape}.")
 
@@ -253,13 +222,48 @@ def get_static_array(raw, n_rows):
         raise KeyError("Raw data is missing canonical static key 'static_features'.")
 
     S = np.asarray(raw[key], dtype=np.float32)
-    if S.ndim == 1:
-        S = S.reshape(-1, 1)
+    if S.shape != (n_rows, D_STATIC_MAX):
+        raise ValueError(
+            f"Raw static_features must have shape ({n_rows}, {D_STATIC_MAX}), got {S.shape}."
+        )
+    if not np.isfinite(S).all():
+        raise ValueError("Raw static_features contains non-finite values.")
+    return S
 
-    if S.shape[0] != n_rows:
-        raise ValueError(f"Raw static_features has {S.shape[0]} rows, expected {n_rows}.")
 
-    return fixed_2d_float(S, rows=n_rows, cols=D_STATIC_MAX)
+def compute_static_stats(static_support):
+    """Per-column standardization statistics for static features."""
+    static_support = np.asarray(static_support, dtype=np.float32)
+    if static_support.ndim != 2:
+        raise ValueError(f"Static support features must be 2-D, got shape={static_support.shape}.")
+    if not np.isfinite(static_support).all():
+        raise ValueError("Static support features contain non-finite values.")
+
+    d_static = int(static_support.shape[-1])
+    static_mean = np.zeros(d_static, dtype=np.float32)
+    static_std = np.ones(d_static, dtype=np.float32)
+
+    for j in range(d_static):
+        column = static_support[:, j]
+        if np.isin(column, (0.0, 1.0)).all():
+            continue
+        static_mean[j] = np.float32(column.mean())
+        static_std[j] = np.float32(max(float(column.std()), 0.1))
+
+    return static_mean, static_std
+
+
+def normalize_static_features(static, static_mean, static_std):
+    static = np.asarray(static, dtype=np.float32)
+    d_static = int(static.shape[-1])
+    mean = np.asarray(static_mean, dtype=np.float32).reshape(1, d_static)
+    std = np.asarray(static_std, dtype=np.float32).reshape(1, d_static)
+
+    out = ((static - mean) / np.maximum(std, 0.1)).astype(np.float32)
+    out = np.clip(out, -STATIC_CLIP_TRAIN, STATIC_CLIP_TRAIN).astype(np.float32)
+    if not np.isfinite(out).all():
+        raise ValueError("Normalized static features contain non-finite values.")
+    return out
 
 
 def compute_support_stats(raw_support, domain, cfg, chosen):
@@ -268,7 +272,11 @@ def compute_support_stats(raw_support, domain, cfg, chosen):
     Y = get_outcome_array(raw_support, domain, cfg)
 
     target_idx = cfg["target_state_index"]
-    if target_idx is not None and 0 <= target_idx < S.shape[-1]:
+    if target_idx is not None:
+        if not 0 <= target_idx < S.shape[-1]:
+            raise ValueError(
+                f"Target state index {target_idx} is outside state width {S.shape[-1]}."
+            )
         cov_idx = [i for i in range(S.shape[-1]) if i != target_idx]
         C = S[:, :, cov_idx]
     else:
@@ -278,81 +286,79 @@ def compute_support_stats(raw_support, domain, cfg, chosen):
     out_vals = []
 
     for i in chosen:
-        end_x = min(int(L[i]), S.shape[1], MAX_SEQ_LEN)
-        end_y = min(int(L[i]) + 1, Y.shape[1], MAX_TARGET_INDEX + 1)
+        end_x = int(L[i])
+        end_y = min(end_x + 1, Y.shape[1])
+        if not 1 <= end_x <= min(S.shape[1], MAX_SEQ_LEN):
+            raise ValueError(f"Support sequence length {end_x} is outside the canonical range.")
+        cov_vals.append(C[i, :end_x, :])
+        out_vals.append(Y[i, :end_y])
 
-        if end_x > 0:
-            cov_vals.append(C[i, :end_x, :])
-        if end_y > 0:
-            out_vals.append(Y[i, :end_y])
+    if not cov_vals:
+        raise ValueError("Support statistics require at least one selected row.")
+    cov_vals = np.concatenate(cov_vals, axis=0)
+    out_vals = np.concatenate(out_vals)
+    if not np.isfinite(cov_vals).all() or not np.isfinite(out_vals).all():
+        raise ValueError("Support statistics require finite states and outcomes.")
 
-    if cov_vals:
-        cov_vals = np.concatenate(cov_vals, axis=0)
-        good = np.isfinite(cov_vals).all(axis=1)
-        cov_vals = cov_vals[good]
+    state_mean = cov_vals.mean(axis=0).astype(np.float32)
+    state_std = np.maximum(cov_vals.std(axis=0), 0.1).astype(np.float32)
+    out_mean = float(np.mean(out_vals))
+    out_std = float(max(np.std(out_vals), 1e-6))
 
-        if cov_vals.shape[0] > 0:
-            state_mean = cov_vals.mean(axis=0).astype(np.float32)
-            state_std = np.maximum(cov_vals.std(axis=0), 0.1).astype(np.float32)
-        else:
-            state_mean = np.zeros(C.shape[-1], dtype=np.float32)
-            state_std = np.ones(C.shape[-1], dtype=np.float32)
-    else:
-        state_mean = np.zeros(C.shape[-1], dtype=np.float32)
-        state_std = np.ones(C.shape[-1], dtype=np.float32)
+    static_all = get_static_array(raw_support, int(Y.shape[0]))
+    static_mean, static_std = compute_static_stats(static_all[np.asarray(chosen, dtype=np.int64)])
 
-    if out_vals:
-        out_vals = np.concatenate(out_vals)
-        out_vals = out_vals[np.isfinite(out_vals)]
-
-        if len(out_vals) > 0:
-            out_mean = float(np.mean(out_vals))
-            out_std = float(max(np.std(out_vals), 1e-6))
-        else:
-            out_mean, out_std = 0.0, 1.0
-    else:
-        out_mean, out_std = 0.0, 1.0
-
-    return state_mean, state_std, out_mean, out_std
+    return state_mean, state_std, static_mean, static_std, out_mean, out_std
 
 
-def build_benchmark_arrays_for_raw(raw, domain, cfg, state_mean, state_std, out_mean, out_std):
-    out_std = max(float(out_std), 1e-6)
+def build_benchmark_arrays_for_raw(
+    raw, domain, cfg, state_mean, state_std, static_mean, static_std, out_mean, out_std
+):
+    out_std = float(out_std)
+    if out_std <= 0:
+        raise ValueError("Outcome standard deviation must be positive.")
 
     L = np.asarray(raw["sequence_lengths"], dtype=np.int64)
     A = get_actions(raw, domain)
     Y = get_outcome_array(raw, domain, cfg).astype(np.float32)
     n = Y.shape[0]
-    static = get_static_array(raw, n)
+    static = normalize_static_features(get_static_array(raw, n), static_mean, static_std)
     S = get_state_array(raw, domain, cfg)
     target_idx = cfg["target_state_index"]
 
-    if target_idx is not None and 0 <= target_idx < S.shape[-1]:
+    if target_idx is not None:
+        if not 0 <= target_idx < S.shape[-1]:
+            raise ValueError(
+                f"Target state index {target_idx} is outside state width {S.shape[-1]}."
+            )
         cov_idx = [i for i in range(S.shape[-1]) if i != target_idx]
         C_raw = S[:, :, cov_idx]
     else:
         C_raw = S
+    if S.shape[:2] != Y.shape or A.shape != Y.shape or L.shape != (n,):
+        raise ValueError("Canonical state, outcome, action, and length shapes are inconsistent.")
 
     dc = C_raw.shape[-1]
     sm = np.asarray(state_mean, dtype=np.float32).reshape(1, 1, dc)
     ss = np.asarray(state_std, dtype=np.float32).reshape(1, 1, dc)
 
     C = ((C_raw - sm) / np.maximum(ss, 0.1)).astype(np.float32)
-    C = finite_or_zero(np.clip(C, -STATE_CLIP_TRAIN, STATE_CLIP_TRAIN))
+    C = np.clip(C, -STATE_CLIP_TRAIN, STATE_CLIP_TRAIN)
 
-    y_norm_unclipped = ((Y - float(out_mean)) / out_std).astype(np.float32)
+    y_norm = ((Y - float(out_mean)) / out_std).astype(np.float32)
     y_norm_clip = np.clip(
-        finite_or_zero(y_norm_unclipped),
+        y_norm,
         -OUTCOME_CLIP_TRAIN,
         OUTCOME_CLIP_TRAIN,
     ).astype(np.float32)
-
-    A = np.clip(A, 0, N_ACTIONS - 1).astype(np.int64)
+    if not np.isfinite(C).all() or not np.isfinite(y_norm).all():
+        raise ValueError("Canonical benchmark arrays contain non-finite normalized values.")
+    if np.any((A < 0) | (A >= N_ACTIONS)):
+        raise ValueError(f"Canonical actions must be within [0, {N_ACTIONS - 1}].")
 
     return {
         "covariates": C.astype(np.float32),
         "y_raw": Y.astype(np.float32),
-        "y_norm_unclipped": y_norm_unclipped.astype(np.float32),
         "y_norm_clip": y_norm_clip.astype(np.float32),
         "actions": A.astype(np.int64),
         "static": static.astype(np.float32),
@@ -420,7 +426,7 @@ def prepare_dataset_bundle(pm, pfile, global_dataset_id):
     n_support_total = int(np.asarray(support_raw["sequence_lengths"]).shape[0])
     chosen = np.arange(n_support_total, dtype=np.int64)
 
-    state_mean, state_std, out_mean, out_std = compute_support_stats(
+    state_mean, state_std, static_mean, static_std, out_mean, out_std = compute_support_stats(
         support_raw,
         domain,
         cfg,
@@ -433,14 +439,22 @@ def prepare_dataset_bundle(pm, pfile, global_dataset_id):
         cfg,
         state_mean=state_mean,
         state_std=state_std,
+        static_mean=static_mean,
+        static_std=static_std,
         out_mean=out_mean,
         out_std=out_std,
     )
+    support_bundle["domain"] = domain
 
     dataset_id = int(pm["dataset_id"])
-    actual_n_ctx = int(support_bundle["covariates"].shape[0])
+    actual_support_size = int(support_bundle["covariates"].shape[0])
     support_size = int(pm["support_size"])
+    if actual_support_size != support_size:
+        raise ValueError(
+            f"Raw benchmark support_size={support_size} differs from its {actual_support_size} support rows."
+        )
     meta = {
+        "dataset_uid": str(pm["dataset_uid"]),
         "domain": domain,
         "domain_key": domain,
         "cfg": cfg,
@@ -450,12 +464,13 @@ def prepare_dataset_bundle(pm, pfile, global_dataset_id):
         "source_path": str(pfile),
         "gamma": pm["gamma"],
         "support_size": int(support_size),
-        "n_ctx": int(actual_n_ctx),
         "replicate": int(pm["rep"]),
         "out_mean": float(out_mean),
-        "out_std": float(max(out_std, 1e-6)),
+        "out_std": float(out_std),
         "state_mean": state_mean,
         "state_std": state_std,
+        "static_mean": static_mean,
+        "static_std": static_std,
         "outcome_name": "outcomes",
         "target_space": str(pm["target_space"]),
         "max_seq_len": int(MAX_SEQ_LEN),
@@ -465,12 +480,16 @@ def prepare_dataset_bundle(pm, pfile, global_dataset_id):
 
 
 def make_query_bundle(raw_query, meta):
-    return build_benchmark_arrays_for_raw(
+    bundle = build_benchmark_arrays_for_raw(
         raw_query,
         meta["domain"],
         meta["cfg"],
         state_mean=meta["state_mean"],
         state_std=meta["state_std"],
+        static_mean=meta["static_mean"],
+        static_std=meta["static_std"],
         out_mean=meta["out_mean"],
         out_std=meta["out_std"],
     )
+    bundle["domain"] = meta["domain"]
+    return bundle

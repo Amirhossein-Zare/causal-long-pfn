@@ -4,11 +4,13 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from clpfn.baselines.common.features import encode_actions, prepare_baseline_bundle
 from clpfn.baselines.common.training import move_float_batch_to_device
 from clpfn.evaluation.core import benchmark as common
 
 class CTSupportDataset(Dataset):
-    def __init__(self, bundle, context_idx):
+    def __init__(self, bundle, context_idx, treatment_mode="multiclass"):
+        bundle = prepare_baseline_bundle(bundle)
         idx = np.asarray(context_idx, dtype=np.int64)
 
         C = bundle["covariates"][idx]
@@ -22,19 +24,17 @@ class CTSupportDataset(Dataset):
 
         actions = A[:, :T_train].astype(np.int64)
 
-        prev_actions = np.zeros_like(actions)
+        self.current_treatments = encode_actions(actions, treatment_mode).astype(np.float32)
+        self.prev_treatments = np.zeros_like(self.current_treatments)
         if T_train > 1:
-            prev_actions[:, 1:] = actions[:, :-1]
-
-        self.prev_treatments = common.action_onehot_2d(prev_actions, common.N_ACTIONS).astype(np.float32)
-        self.current_treatments = common.action_onehot_2d(actions, common.N_ACTIONS).astype(np.float32)
+            self.prev_treatments[:, 1:] = self.current_treatments[:, :-1]
         self.vitals = C[:, :T_train, :].astype(np.float32)
         self.prev_outputs = Yc[:, :T_train, None].astype(np.float32)
         self.outputs = Yc[:, 1:T_train + 1, None].astype(np.float32)
         self.static_features = S.astype(np.float32)
 
         t_grid = np.arange(T_train)[None, :]
-        active = ((t_grid + 1) < Lseq[:, None]).astype(np.float32)[:, :, None]
+        active = ((t_grid + 1) <= Lseq[:, None]).astype(np.float32)[:, :, None]
         active *= np.isfinite(self.outputs).astype(np.float32)
 
         keep = active.sum(axis=(1, 2)) > 0

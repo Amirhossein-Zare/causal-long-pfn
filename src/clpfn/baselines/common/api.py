@@ -7,14 +7,14 @@ from typing import Any, Callable
 
 import numpy as np
 
-from clpfn.evaluation.core import benchmark as common
-
 
 @dataclass
 class Prediction:
     pred_norm: float
     predict_time_sec: float
     path: np.ndarray | None = None
+    pred_norm_unclipped: float | None = None
+    unclipped_path: np.ndarray | None = None
     info: dict[str, Any] = field(default_factory=dict)
 
 
@@ -30,7 +30,6 @@ class BaselineAdapter:
     method_family: str
     title: str
     default_hparams: dict[str, Any]
-    tuning_cache: dict[Any, Any]
 
     hyperparameter_space: Callable[[dict[str, Any]], tuple[dict[str, Any], dict[str, Any]]]
     sample_candidates: Callable[[dict[str, Any], int, int], list[dict[str, Any]]]
@@ -41,27 +40,26 @@ class BaselineAdapter:
     extra_record_fields: Callable[[dict[str, Any], Prediction, dict[str, Any], dict[str, Any]], dict[str, Any]]
     extra_meta_fields: Callable[[dict[str, Any]], dict[str, Any]]
 
-    cleanup_payload: Callable[[Any], None] | None = None
+    configure_from_eval_config: Callable[[dict[str, Any]], None] | None = None
+    select_hparams: Callable[..., tuple[dict[str, Any], dict[str, Any]]] | None = None
     tuning_diag_fields: Callable[[dict[str, Any]], dict[str, Any]] | None = None
     tuning_candidate_label: Callable[[dict[str, Any]], str] | None = None
     initial_random_search: int = 40
-    top_k_reuse: int = 1
+    hpo_plan_seed: int = 1701
+    hpo_split_seed: int = 2701
+    hpo_train_seed: int = 3701
+    hpo_validation_seed: int = 4701
     tune_val_frac: float = 0.20
-    val_min: int = 8
-    val_max: int = 48
-    tuning_strategy: str = "grouped_support_search40_reuse1"
+    val_min: int = 10
+    val_max: int = 64
+    tuning_strategy: str = "task_specific_support_only_search"
     run_id: str = ""
     output_dir: Path | None = None
     device_label: str | None = None
 
     def __post_init__(self) -> None:
-        if not self.run_id:
-            self.refresh_run_id()
         if self.output_dir is None:
             self.output_dir = Path("outputs") / "eval" / f"{self.method_name}"
-
-    def refresh_run_id(self) -> None:
-        self.run_id = f"{self.method_name}_seed{common.SEED}_{int(time.time())}"
 
 
 def canonical_hparams(hparams: dict[str, Any]) -> dict[str, Any]:
@@ -114,17 +112,21 @@ def single_rollout_predict_rows(
         out = []
         for row_id, current_t, target_t in zip(rows, current_ts, target_ts):
             started = time.time()
-            pred_norm, pred_path = predict_fn(
+            result = predict_fn(
                 *args,
                 query_bundle,
                 row_id=int(row_id),
                 t_obs=int(current_t),
                 t_target=int(target_t),
+                return_unclipped=True,
             )
+            pred_norm, pred_path, pred_path_unclipped = result
             out.append(
                 Prediction(
                     pred_norm=float(pred_norm),
                     path=np.asarray(pred_path),
+                    pred_norm_unclipped=float(np.asarray(pred_path_unclipped)[-1]),
+                    unclipped_path=np.asarray(pred_path_unclipped),
                     predict_time_sec=float(time.time() - started),
                 )
             )
@@ -140,12 +142,12 @@ def train_diag_record_fields(
 ):
     def _fields(train_diag, _prediction, tune_info, _meta):
         fields = {
-            key: float(train_diag.get(key, np.nan))
+            key: float(train_diag[key])
             for key in float_keys
         }
         fields.update(
             {
-                key: int(train_diag.get(key, 0))
+                key: int(train_diag[key])
                 for key in int_keys
             }
         )
@@ -157,15 +159,11 @@ def train_diag_record_fields(
 def baseline_port_metadata(**extra: Any) -> dict[str, Any]:
     meta: dict[str, Any] = {
         "baseline_runtime": "pytorch_training",
-        "baseline_tuning_contract": "grouped_support_tuning_domain_plus_support_size",
+        "baseline_tuning_contract": "task_specific_support_only_tuning_with_atomic_resume",
         "baseline_target_convention": "CLPFN benchmark normalized target y[t_target]",
     }
     meta.update(extra)
     return meta
-
-
-def _project_root() -> Path:
-    return Path(__file__).resolve().parents[4]
 
 
 def require_baseline_config(config: dict[str, Any] | None, method: str) -> dict[str, Any]:
@@ -177,9 +175,9 @@ def require_baseline_config(config: dict[str, Any] | None, method: str) -> dict[
     return config
 
 
-def replace_mapping(target: dict[str, Any], values: dict[str, Any] | None) -> dict[str, Any]:
+def replace_mapping(target: dict[str, Any], values: dict[str, Any]) -> dict[str, Any]:
     from copy import deepcopy
 
     target.clear()
-    target.update(deepcopy(values or {}))
+    target.update(deepcopy(values))
     return target

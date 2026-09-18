@@ -1,17 +1,7 @@
-"""Adams/WhyNot-style HIV benchmark generator for CausalLongPFN evaluation.
-
-This generator preserves:
-
-* 6-compartment Adams/WhyNot HIV ODE dynamics.
-* 4-action therapy mapping.
-* Gamma-controlled behavioral-policy confounding.
-* log10(1 + free_virus) target space.
-
-"""
+"""HIV benchmark generator."""
 
 from __future__ import annotations
 
-import copy
 import dataclasses
 import gc
 import logging
@@ -22,18 +12,19 @@ import numpy as np
 import pandas as pd
 from scipy.integrate import odeint
 
-from .common import concat_raw, ensure_output_dir, save_pickle, standardize_pickle_map, take_rows
+from .common import ensure_output_dir, save_pickle, standardize_pickle_map, write_dataset_manifest
 
 LOGGER = logging.getLogger(__name__)
 
 
 @dataclasses.dataclass
 class HIVGeneratorConfig:
-    output_dir: str = "outputs/data/hiv"
+    output_dir: str = "outputs/benchmarks/hiv"
+    overwrite: bool = False
 
-    gammas: tuple[int, ...] = (1, 2, 3, 4, 5, 6, 7, 8, 9, 10)
+    gammas: tuple[int, ...] = (1, 3, 5, 7, 9)
     support_sizes: tuple[int, ...] = (40, 80, 160, 320, 500)
-    reps_per_cell: int = 2
+    reps_per_cell: int = 1
 
     test_base_patients: int = 1
     seq_length: int = 60
@@ -44,17 +35,33 @@ class HIVGeneratorConfig:
     base_seed: int = 3000
 
     @classmethod
-    def from_dict(cls, values: dict[str, Any] | None = None, **overrides: Any) -> "HIVGeneratorConfig":
+    def from_dict(cls, values: dict[str, Any] | None = None) -> "HIVGeneratorConfig":
         values = dict(values or {})
-        values.update({k: v for k, v in overrides.items() if v is not None})
         valid = {field.name for field in dataclasses.fields(cls)}
-        return cls(**{k: v for k, v in values.items() if k in valid})
+        unknown = sorted(set(values) - valid)
+        if unknown:
+            raise KeyError(f"Unknown HIV generator configuration keys: {unknown}")
+        return cls(**values)
 
     def __post_init__(self) -> None:
         self.gammas = tuple(int(x) for x in self.gammas)
         self.support_sizes = tuple(int(x) for x in self.support_sizes)
         if self.n_seq_random_trajectories is None:
             self.n_seq_random_trajectories = int(self.projection_horizon) * 2
+        if not self.gammas or any(gamma < 0 for gamma in self.gammas):
+            raise ValueError("gammas must contain non-negative values.")
+        if not self.support_sizes or any(size < 1 for size in self.support_sizes):
+            raise ValueError("support_sizes must contain positive values.")
+        if self.reps_per_cell < 1 or self.test_base_patients < 1:
+            raise ValueError("reps_per_cell and test_base_patients must be positive.")
+        if self.seq_length < 2 or self.projection_horizon < 1:
+            raise ValueError("seq_length must exceed one and projection_horizon must be positive.")
+        if not 1 <= self.min_t_obs < self.seq_length:
+            raise ValueError("min_t_obs must be within the generated sequence.")
+        if self.projection_horizon >= self.seq_length - self.min_t_obs:
+            raise ValueError("The sequence must contain a complete projection after min_t_obs.")
+        if self.n_seq_random_trajectories < 1:
+            raise ValueError("n_seq_random_trajectories must be positive.")
 
 
 D_STATE = 6
@@ -190,9 +197,7 @@ def get_scaling_params(sim: dict[str, Any]) -> tuple[pd.Series, pd.Series]:
     return pd.Series(means), pd.Series(stds)
 
 
-# -----------------------------------------------------------------------------
 # HIV ODE dynamics
-# -----------------------------------------------------------------------------
 
 def hiv_dynamics(state: np.ndarray, time: float, config: HIVODEConfig) -> list[float]:
     (
@@ -259,9 +264,7 @@ def integrate_one_bin(raw_state: np.ndarray, profile: PatientProfile, action: in
     return out
 
 
-# -----------------------------------------------------------------------------
 # Heterogeneity and behavior policy
-# -----------------------------------------------------------------------------
 
 def sample_patient_profile(rng: np.random.Generator) -> PatientProfile:
     cfg = HIVODEConfig(
@@ -342,9 +345,7 @@ def sequential_policy(raw_state: np.ndarray, prev_action: int, gamma: int, profi
     return int(rng.choice(N_ACTIONS, p=probs))
 
 
-# -----------------------------------------------------------------------------
 # Patient trajectory simulation
-# -----------------------------------------------------------------------------
 
 def simulate_factual_patient(rng: np.random.Generator, gamma: int, seq_length: int) -> dict[str, Any]:
     profile = sample_patient_profile(rng)
@@ -369,7 +370,7 @@ def simulate_factual_patient(rng: np.random.Generator, gamma: int, seq_length: i
         prev_action = action
 
     profile_summary = profile_to_static_summary(profile)
-    
+
     return {
         "profile": profile,
         "profile_summary": profile_summary,
@@ -421,9 +422,7 @@ def simulate_factual_dataset(rng: np.random.Generator, num_patients: int, gamma:
     }
 
 
-# -----------------------------------------------------------------------------
 # Counterfactual test rows
-# -----------------------------------------------------------------------------
 
 def simulate_one_step_counterfactual_rows(rng: np.random.Generator, num_patients: int, gamma: int, seq_length: int, min_tobs: int) -> dict[str, np.ndarray]:
     max_rows = num_patients * seq_length * N_ACTIONS
@@ -434,6 +433,7 @@ def simulate_one_step_counterfactual_rows(rng: np.random.Generator, num_patients
     sequence_lengths = np.zeros(max_rows, dtype=np.int64)
     patient_ids = np.zeros(max_rows, dtype=np.int64)
     patient_current_t = np.zeros(max_rows, dtype=np.int64)
+    is_factual = np.zeros(max_rows, dtype=bool)
     eff_rti_scale = np.zeros(max_rows, dtype=np.float32)
     eff_pi_scale = np.zeros(max_rows, dtype=np.float32)
     virus_threshold = np.zeros(max_rows, dtype=np.float32)
@@ -470,6 +470,7 @@ def simulate_one_step_counterfactual_rows(rng: np.random.Generator, num_patients
                 sequence_lengths[row] = t + 1
                 patient_ids[row] = pid
                 patient_current_t[row] = t
+                is_factual[row] = action == int(factual_actions[t])
                 eff_rti_scale[row] = ps["eff_rti_scale"]
                 eff_pi_scale[row] = ps["eff_pi_scale"]
                 virus_threshold[row] = ps["virus_threshold"]
@@ -485,6 +486,7 @@ def simulate_one_step_counterfactual_rows(rng: np.random.Generator, num_patients
         "sequence_lengths": sequence_lengths[:row],
         "patient_ids_all_trajectories": patient_ids[:row],
         "patient_current_t": patient_current_t[:row],
+        "is_factual": is_factual[:row],
         "eff_rti_scale": eff_rti_scale[:row],
         "eff_pi_scale": eff_pi_scale[:row],
         "virus_threshold": virus_threshold[:row],
@@ -583,57 +585,41 @@ def simulate_sequence_counterfactual_rows(
     }
 
 
-# -----------------------------------------------------------------------------
 # Valid-data wrappers and dataset assembly
-# -----------------------------------------------------------------------------
 
 def make_support_data(rng: np.random.Generator, support_size: int, gamma: int, seq_length: int, min_tobs: int) -> dict[str, Any]:
     raw = simulate_factual_dataset(rng=rng, num_patients=support_size, gamma=gamma, seq_length=seq_length)
-    keep = np.where(raw["sequence_lengths"] >= min_tobs)[0]
-    raw = take_rows(raw, keep)
-
-    if raw["states"].shape[0] < support_size:
-        chunks = [raw]
-        n_kept = raw["states"].shape[0]
-        while n_kept < support_size:
-            extra = simulate_factual_dataset(rng=rng, num_patients=max(support_size, 50), gamma=gamma, seq_length=seq_length)
-            keep = np.where(extra["sequence_lengths"] >= min_tobs)[0]
-            extra = take_rows(extra, keep)
-            chunks.append(extra)
-            n_kept += extra["states"].shape[0]
-        raw = concat_raw(chunks)
-
-    return take_rows(raw, np.arange(support_size))
+    if np.any(raw["sequence_lengths"] < min_tobs):
+        raise ValueError("HIV support simulation produced an incomplete trajectory.")
+    return raw
 
 
-def make_valid_one_step_test_data(rng: np.random.Generator, gamma: int, cfg: HIVGeneratorConfig, max_attempts: int = 100) -> tuple[dict[str, Any], int]:
-    for attempt in range(max_attempts):
-        raw = simulate_one_step_counterfactual_rows(
-            rng=rng,
-            num_patients=cfg.test_base_patients,
-            gamma=gamma,
-            seq_length=cfg.seq_length,
-            min_tobs=cfg.min_t_obs,
-        )
-        if raw["states"].shape[0] > 0:
-            return raw, attempt + 1
-    raise RuntimeError(f"Could not generate non-empty one-step HIV test data for gamma={gamma}.")
+def make_one_step_test_data(rng: np.random.Generator, gamma: int, cfg: HIVGeneratorConfig) -> dict[str, Any]:
+    raw = simulate_one_step_counterfactual_rows(
+        rng=rng,
+        num_patients=cfg.test_base_patients,
+        gamma=gamma,
+        seq_length=cfg.seq_length,
+        min_tobs=cfg.min_t_obs,
+    )
+    if raw["states"].shape[0] == 0:
+        raise RuntimeError(f"HIV one-step query construction produced no rows for gamma={gamma}.")
+    return raw
 
 
-def make_valid_seq_test_data(rng: np.random.Generator, gamma: int, cfg: HIVGeneratorConfig, max_attempts: int = 100) -> tuple[dict[str, Any], int]:
-    for attempt in range(max_attempts):
-        raw = simulate_sequence_counterfactual_rows(
-            rng=rng,
-            num_patients=cfg.test_base_patients,
-            gamma=gamma,
-            seq_length=cfg.seq_length,
-            projection_horizon=cfg.projection_horizon,
-            min_tobs=cfg.min_t_obs,
-            n_random_trajectories=int(cfg.n_seq_random_trajectories),
-        )
-        if raw["states"].shape[0] > 0:
-            return raw, attempt + 1
-    raise RuntimeError(f"Could not generate non-empty sequence HIV test data for gamma={gamma}.")
+def make_sequence_test_data(rng: np.random.Generator, gamma: int, cfg: HIVGeneratorConfig) -> dict[str, Any]:
+    raw = simulate_sequence_counterfactual_rows(
+        rng=rng,
+        num_patients=cfg.test_base_patients,
+        gamma=gamma,
+        seq_length=cfg.seq_length,
+        projection_horizon=cfg.projection_horizon,
+        min_tobs=cfg.min_t_obs,
+        n_random_trajectories=int(cfg.n_seq_random_trajectories),
+    )
+    if raw["states"].shape[0] == 0:
+        raise RuntimeError(f"HIV sequence query construction produced no rows for gamma={gamma}.")
+    return raw
 
 
 def make_dataset(dataset_id: int, gamma: int, support_size: int, rep: int, seed: int, cfg: HIVGeneratorConfig) -> dict[str, Any]:
@@ -651,8 +637,8 @@ def make_dataset(dataset_id: int, gamma: int, support_size: int, rep: int, seed:
     )
 
     support_data = make_support_data(rng=rng, support_size=support_size, gamma=gamma, seq_length=cfg.seq_length, min_tobs=cfg.min_t_obs)
-    test_data_counterfactuals, one_step_attempts = make_valid_one_step_test_data(rng=rng, gamma=gamma, cfg=cfg)
-    test_data_seq, seq_attempts = make_valid_seq_test_data(rng=rng, gamma=gamma, cfg=cfg)
+    test_data_counterfactuals = make_one_step_test_data(rng=rng, gamma=gamma, cfg=cfg)
+    test_data_seq = make_sequence_test_data(rng=rng, gamma=gamma, cfg=cfg)
     test_data_factuals = simulate_factual_dataset(rng=rng, num_patients=cfg.test_base_patients, gamma=gamma, seq_length=cfg.seq_length)
     scaling_data = get_scaling_params(support_data)
 
@@ -680,8 +666,6 @@ def make_dataset(dataset_id: int, gamma: int, support_size: int, rep: int, seed:
         "target_feature_name": TARGET_NAME,
         "target_space": "log10_1p_free_virus",
         "action_mapping": {0: "no_therapy", 1: "PI_only", 2: "RTI_only", 3: "RTI_plus_PI"},
-        "test_one_step_resample_attempts": int(one_step_attempts),
-        "test_seq_resample_attempts": int(seq_attempts),
         "support_data": support_data,
         "test_data": test_data_counterfactuals,
         "test_data_factuals": test_data_factuals,
@@ -700,12 +684,10 @@ def make_dataset(dataset_id: int, gamma: int, support_size: int, rep: int, seed:
     )
 
 
-def generate(config: HIVGeneratorConfig | None = None, **overrides: Any) -> pd.DataFrame:
-    cfg = config or HIVGeneratorConfig()
-    if overrides:
-        cfg = HIVGeneratorConfig.from_dict(dataclasses.asdict(cfg), **overrides)
+def generate(config: HIVGeneratorConfig | None = None) -> pd.DataFrame:
+    cfg = HIVGeneratorConfig() if config is None else config
 
-    output_dir = ensure_output_dir(cfg.output_dir)
+    output_dir = ensure_output_dir(cfg.output_dir, overwrite=bool(cfg.overwrite))
 
     summary_rows: list[dict[str, Any]] = []
     dataset_id = 0
@@ -727,6 +709,7 @@ def generate(config: HIVGeneratorConfig | None = None, **overrides: Any) -> pd.D
                 )
                 file_path = output_dir / file_name
                 save_pickle(pickle_map, file_path)
+                write_dataset_manifest(pickle_map, file_path, generator_config=dataclasses.asdict(cfg), generator_source=__file__)
 
                 one_step_rows = pickle_map["test_data"]["states"].shape[0]
                 seq_rows = pickle_map["test_data_seq"]["states"].shape[0]
@@ -750,8 +733,6 @@ def generate(config: HIVGeneratorConfig | None = None, **overrides: Any) -> pd.D
                         "test_size_base_patients": cfg.test_base_patients,
                         "test_data_rows_one_step_counterfactual": one_step_rows,
                         "test_data_seq_rows_multi_step_counterfactual": seq_rows,
-                        "test_one_step_resample_attempts": pickle_map["test_one_step_resample_attempts"],
-                        "test_seq_resample_attempts": pickle_map["test_seq_resample_attempts"],
                         "min_t_obs": cfg.min_t_obs,
                         "seq_length": cfg.seq_length,
                         "projection_horizon": cfg.projection_horizon,

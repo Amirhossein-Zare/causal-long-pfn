@@ -1,46 +1,85 @@
 method: gnet
-
 data:
-  wanted_domains: [cancer, hiv, warfarin, mimic]
+  wanted_domains:
+  - cancer
+  - hiv
+  - warfarin
+  - mimic
   raw_inputs:
     pickle_dirs:
-      - outputs/data/cancer
-      - outputs/data/hiv
-      - outputs/data/warfarin
-      - outputs/data/mimic
-
+    - outputs/benchmarks/cancer
+    - outputs/benchmarks/hiv
+    - outputs/benchmarks/warfarin
+    - outputs/benchmarks/mimic
 evaluation:
   output_dir: outputs/eval/gnet
-
+  query_seed: 4242
 tuning:
   initial_random_search: 40
-  top_k_reuse: 1
-
+  state_dir: outputs/tuning_state/gnet
+  plan_seed: 1701
+  split_seed: 2701
+  train_seed: 3701
+  validation_seed: 4701
+fitting:
+  fit_root: outputs/fits
+  final_fit_seed: 101
 baseline:
   limits:
-    max_val_origins: 256
-
+    max_val_origins: 512
   default_hparams:
-    seq_hidden_units: 64
-    r_size: 64
-    fc_hidden_units: 64
-    dropout_rate: 0.10
+    seq_hidden_units: 48
+    r_size: 24
+    fc_hidden_units: 96
+    dropout_rate: 0.1
     num_layer: 1
     epochs: 100
-    batch_size: 64
-    learning_rate: 1.0e-3
-    weight_decay: 1.0e-5
-    optimizer_cls: adamw
+    batch_size: 128
+    learning_rate: 0.001
+    weight_decay: 0.0
+    optimizer_cls: adam
     grad_clip: 1.0
-    vitals_loss_weight: 0.25
-    mc_samples: 1
-
+    vitals_loss_weight: 1.0
+    residual_holdout_ratio: 0.1
+    mc_samples: 50
   search_space:
-    hidden_size: [48, 64, 96, 128]
-    r_size: [48, 64, 96]
-    num_layers: [1, 2]
-    dropout: [0.05, 0.10, 0.20]
-    lr: [1.0e-3, 3.0e-4]
-    batch_size: [32, 64]
-    epochs: [80, 120]
-    vitals_loss_weight: [0.15, 0.25, 0.35]
+    seq_hidden_multiplier:
+    - 0.5
+    - 1.0
+    - 2.0
+    - 3.0
+    - 4.0
+    r_size_multiplier:
+    - 0.5
+    - 1.0
+    - 2.0
+    - 3.0
+    - 4.0
+    fc_hidden_multiplier:
+    - 0.5
+    - 1.0
+    - 2.0
+    - 3.0
+    - 4.0
+    max_width:
+    - 320
+    num_layers:
+    - 1
+    dropout:
+    - 0.1
+    - 0.2
+    - 0.3
+    - 0.4
+    - 0.5
+    lr:
+    - 0.01
+    - 0.001
+    - 0.0001
+    batch_size:
+    - 64
+    - 128
+    - 256
+    epochs:
+    - 100
+execution:
+  mode: tune

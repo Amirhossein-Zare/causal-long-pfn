@@ -114,7 +114,9 @@ def _normalized_calibration_rows(calibration_df: pd.DataFrame) -> pd.DataFrame:
 
 def _one_step_rmse_by_domain_method(prediction_df: pd.DataFrame) -> pd.DataFrame:
     point_summary = summarize_domain_task_rmse(prediction_df)
-    one_step = point_summary[point_summary["task_step"].astype(str) == "one_step"].copy()
+    one_step = point_summary[
+        point_summary["reported_task"].astype(str) == "one_step_exhaustive"
+    ].copy()
     return one_step[["domain", "method", "mean_norm_rmse"]].rename(
         columns={"mean_norm_rmse": "rmse_norm"}
     )

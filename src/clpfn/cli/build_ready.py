@@ -13,6 +13,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Build CausalLongPFN-ready files from raw benchmark pickles.")
     parser.add_argument("--config", default="configs/eval/pfn.yaml", help="Ready-builder YAML config.")
     parser.add_argument("--output-dir", default=None, help="Optional override for ready_builder.output_dir.")
+    parser.add_argument("--overwrite", action="store_true", help="Replace files in an existing ready build directory.")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -25,8 +26,10 @@ def main() -> None:
         raw_inputs=pick(data_cfg, "raw_inputs", pick(ready_cfg, "raw_inputs", {})),
         pfn_max_context=pick(ready_cfg, "pfn_max_context", 500),
         max_test_rows_per_task=pick(ready_cfg, "max_test_rows_per_task", None),
-        output_dir=args.output_dir if args.output_dir is not None else pick(ready_cfg, "output_dir", "outputs/pfn_ready/all_domains"),
+        output_dir=args.output_dir if args.output_dir is not None else pick(ready_cfg, "output_dir", rb.DEFAULT_OUTPUT_DIR),
         seed=pick(ready_cfg, "seed", 2026),
+        overwrite=bool(args.overwrite or pick(ready_cfg, "overwrite", False)),
+        ready_build_id=pick(ready_cfg, "ready_build_id", None),
     )
 
     print("\nReady build complete")

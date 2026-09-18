@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "causal-long-pfn"
-version = "0.1.0"
+version = "1.0.0"
 description = "CausalLongPFN benchmark generation, training, evaluation, baselines, aggregation, and calibration."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -19,6 +19,7 @@ dependencies = [
   "tqdm",
   "h5py",
   "torch",
+  "safetensors",
 ]
 
 [project.scripts]

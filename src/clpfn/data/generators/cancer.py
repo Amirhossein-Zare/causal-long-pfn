@@ -1,26 +1,4 @@
-"""Cancer tumor-growth benchmark generator.
-
-This module follows the tumor-growth simulation family used by longitudinal
-counterfactual baselines such as RMSN, CRN, Causal Transformer, and
-G-Transformer. It exports the canonical CLPFN benchmark raw-pickle schema while keeping
-the domain-specific tumor dynamics and treatment-policy confounding explicit.
-
-The generator preserves:
-
-* CT-style tumor dynamics and treatment-policy confounding.
-* log1p(clipped volume) export for PFN-facing data.
-* The canonical raw-pickle keys expected by PFN and baseline evaluators.
-* One-step counterfactual rows and 5-step random-trajectory rows.
-
-Use from Python:
-
-    from clpfn.data.generators.cancer import CancerGeneratorConfig, generate
-    generate(CancerGeneratorConfig(output_dir="outputs/data/cancer"))
-
-or from CLI:
-
-    clpfn-generate-all --config configs/data/all_benchmarks.yaml --only cancer
-"""
+"""Cancer tumor-growth benchmark generator."""
 
 from __future__ import annotations
 
@@ -33,18 +11,19 @@ import numpy as np
 import pandas as pd
 from scipy.stats import truncnorm
 
-from .common import concat_raw, ensure_output_dir, save_pickle, standardize_pickle_map, take_rows
+from .common import concat_raw, ensure_output_dir, save_pickle, standardize_pickle_map, take_rows, write_dataset_manifest
 
 LOGGER = logging.getLogger(__name__)
 
 
 @dataclasses.dataclass
 class CancerGeneratorConfig:
-    output_dir: str = "outputs/data/cancer"
+    output_dir: str = "outputs/benchmarks/cancer"
+    overwrite: bool = False
 
-    gammas: tuple[int, ...] = (1, 2, 3, 4, 5, 6, 7, 8, 9, 10)
+    gammas: tuple[int, ...] = (1, 3, 5, 7, 9)
     support_sizes: tuple[int, ...] = (40, 80, 160, 320, 500)
-    reps_per_cell: int = 2
+    reps_per_cell: int = 1
 
     test_base_patients: int = 1
     seq_length: int = 60
@@ -56,22 +35,36 @@ class CancerGeneratorConfig:
     base_seed: int = 1000
 
     @classmethod
-    def from_dict(cls, values: dict[str, Any] | None = None, **overrides: Any) -> "CancerGeneratorConfig":
+    def from_dict(cls, values: dict[str, Any] | None = None) -> "CancerGeneratorConfig":
         values = dict(values or {})
-        values.update({k: v for k, v in overrides.items() if v is not None})
         valid = {field.name for field in dataclasses.fields(cls)}
-        return cls(**{k: v for k, v in values.items() if k in valid})
+        unknown = sorted(set(values) - valid)
+        if unknown:
+            raise KeyError(f"Unknown cancer generator configuration keys: {unknown}")
+        return cls(**values)
 
     def __post_init__(self) -> None:
         self.gammas = tuple(int(x) for x in self.gammas)
         self.support_sizes = tuple(int(x) for x in self.support_sizes)
         if self.n_seq_random_trajectories is None:
             self.n_seq_random_trajectories = int(self.projection_horizon) * 2
+        if not self.gammas or any(gamma < 0 for gamma in self.gammas):
+            raise ValueError("gammas must contain non-negative values.")
+        if not self.support_sizes or any(size < 1 for size in self.support_sizes):
+            raise ValueError("support_sizes must contain positive values.")
+        if self.reps_per_cell < 1 or self.test_base_patients < 1:
+            raise ValueError("reps_per_cell and test_base_patients must be positive.")
+        if self.seq_length < 2 or self.projection_horizon < 1:
+            raise ValueError("seq_length must exceed one and projection_horizon must be positive.")
+        if not 1 <= self.min_t_obs < self.seq_length:
+            raise ValueError("min_t_obs must be within the generated sequence.")
+        if self.projection_horizon >= self.seq_length - self.min_t_obs:
+            raise ValueError("The sequence must contain a complete projection after min_t_obs.")
+        if self.window_size < 1 or self.n_seq_random_trajectories < 1:
+            raise ValueError("window_size and n_seq_random_trajectories must be positive.")
 
 
-# -----------------------------------------------------------------------------
-# CT simulation constants
-# -----------------------------------------------------------------------------
+# Simulation constants
 
 def calc_volume(diameter: np.ndarray | float) -> np.ndarray | float:
     return 4.0 / 3.0 * np.pi * (diameter / 2.0) ** 3.0
@@ -203,9 +196,7 @@ def get_confounding_params(num_patients: int, gamma: int | float, window_size: i
     return params
 
 
-# -----------------------------------------------------------------------------
 # Raw helpers and scaling
-# -----------------------------------------------------------------------------
 
 def filter_factual_min_tobs(raw: dict[str, Any], min_tobs: int) -> tuple[dict[str, Any], np.ndarray]:
     keep = np.where(np.asarray(raw["sequence_lengths"], dtype=np.int64) >= int(min_tobs))[0]
@@ -213,8 +204,6 @@ def filter_factual_min_tobs(raw: dict[str, Any], min_tobs: int) -> tuple[dict[st
 
 
 def log_export(raw: dict[str, Any]) -> dict[str, Any]:
-    # Intentional PFN-facing difference from CT:
-    # store log1p(clipped tumor volume), not raw tumor volume.
     raw = dict(raw)
     raw["cancer_volume"] = np.log1p(np.clip(raw["cancer_volume"], 0.0, TUMOUR_DEATH_THRESHOLD))
     return raw
@@ -242,9 +231,7 @@ def get_scaling_params(sim: dict[str, Any]) -> tuple[pd.Series, pd.Series]:
     return pd.Series(means), pd.Series(stds)
 
 
-# -----------------------------------------------------------------------------
-# CT factual simulation
-# -----------------------------------------------------------------------------
+# Factual simulation
 
 def simulate_factual(simulation_params: dict[str, Any], num_time_steps: int) -> dict[str, np.ndarray]:
     total_num_radio_treatments = 1
@@ -318,12 +305,16 @@ def simulate_factual(simulation_params: dict[str, Any], num_time_steps: int) -> 
                 current_chemo_dose = chemo_amt[0]
 
             chemo_dosage[i, t] = previous_chemo_dose * np.exp(-np.log(2) / drug_half_life) + current_chemo_dose
-            cancer_volume[i, t + 1] = cancer_volume[i, t] * (
-                1
-                + rho * np.log(K / cancer_volume[i, t])
-                - beta_c * chemo_dosage[i, t]
-                - (alpha * radio_dosage[i, t] + beta * radio_dosage[i, t] ** 2)
-                + noise[t]
+            cancer_volume[i, t + 1] = max(
+                0.0,
+                cancer_volume[i, t]
+                * (
+                    1
+                    + rho * np.log(K / cancer_volume[i, t])
+                    - beta_c * chemo_dosage[i, t]
+                    - (alpha * radio_dosage[i, t] + beta * radio_dosage[i, t] ** 2)
+                    + noise[t]
+                ),
             )
 
             if cancer_volume[i, t + 1] > TUMOUR_DEATH_THRESHOLD:
@@ -378,9 +369,7 @@ def make_support_data(support_size: int, gamma: int, window_size: int, seq_lengt
     return take_rows(support, np.arange(support_size))
 
 
-# -----------------------------------------------------------------------------
-# CT one-step counterfactual test rows
-# -----------------------------------------------------------------------------
+# One-step counterfactual test rows
 
 def simulate_counterfactual_1_step(simulation_params: dict[str, Any], num_time_steps: int, min_tobs: int) -> dict[str, np.ndarray]:
     total_num_radio_treatments = 1
@@ -412,6 +401,9 @@ def simulate_counterfactual_1_step(simulation_params: dict[str, Any], num_time_s
     radio_application_point = np.zeros((num_test_points, num_time_steps))
     sequence_lengths = np.zeros(num_test_points)
     patient_types_all = np.zeros(num_test_points)
+    patient_ids_all = np.zeros(num_test_points, dtype=np.int64)
+    patient_current_t = np.zeros(num_test_points, dtype=np.int64)
+    is_factual = np.zeros(num_test_points, dtype=bool)
     test_idx = 0
 
     for i in range(num_patients):
@@ -462,6 +454,9 @@ def simulate_counterfactual_1_step(simulation_params: dict[str, Any], num_time_s
                 chemo_application_point[test_idx] = factual_chemo_application
                 radio_application_point[test_idx] = factual_radio_application
                 patient_types_all[test_idx] = patient_types[i]
+                patient_ids_all[test_idx] = i
+                patient_current_t[test_idx] = t
+                is_factual[test_idx] = True
                 sequence_lengths[test_idx] = int(t) + 1
                 test_idx += 1
 
@@ -493,6 +488,8 @@ def simulate_counterfactual_1_step(simulation_params: dict[str, Any], num_time_s
                     chemo_application_point[test_idx][: t + 1] = np.append(factual_chemo_application[:t], [counterfactual_chemo_application])
                     radio_application_point[test_idx][: t + 1] = np.append(factual_radio_application[:t], [counterfactual_radio_application])
                     patient_types_all[test_idx] = patient_types[i]
+                    patient_ids_all[test_idx] = i
+                    patient_current_t[test_idx] = t
                     sequence_lengths[test_idx] = int(t) + 1
                     test_idx += 1
 
@@ -505,12 +502,13 @@ def simulate_counterfactual_1_step(simulation_params: dict[str, Any], num_time_s
         "radio_application": radio_application_point[:test_idx],
         "sequence_lengths": sequence_lengths[:test_idx],
         "patient_types": patient_types_all[:test_idx],
+        "patient_ids_all_trajectories": patient_ids_all[:test_idx],
+        "patient_current_t": patient_current_t[:test_idx],
+        "is_factual": is_factual[:test_idx],
     }
 
 
-# -----------------------------------------------------------------------------
-# CT 5-step random-trajectory counterfactual rows
-# -----------------------------------------------------------------------------
+# 5-step random-trajectory counterfactual rows
 
 def simulate_counterfactuals_random_trajectories(
     simulation_params: dict[str, Any],
@@ -658,9 +656,7 @@ def simulate_counterfactuals_random_trajectories(
     }
 
 
-# -----------------------------------------------------------------------------
 # Resampling wrappers and dataset assembly
-# -----------------------------------------------------------------------------
 
 def make_valid_factual_test_data(gamma: int, window_size: int, seq_length: int, min_tobs: int, test_base_patients: int, max_attempts: int = 200) -> tuple[dict[str, Any], int]:
     for attempt in range(max_attempts):
@@ -787,12 +783,10 @@ def make_dataset(dataset_id: int, gamma: int, support_size: int, rep: int, seed:
     )
 
 
-def generate(config: CancerGeneratorConfig | None = None, **overrides: Any) -> pd.DataFrame:
-    cfg = config or CancerGeneratorConfig()
-    if overrides:
-        cfg = CancerGeneratorConfig.from_dict(dataclasses.asdict(cfg), **overrides)
+def generate(config: CancerGeneratorConfig | None = None) -> pd.DataFrame:
+    cfg = CancerGeneratorConfig() if config is None else config
 
-    output_dir = ensure_output_dir(cfg.output_dir)
+    output_dir = ensure_output_dir(cfg.output_dir, overwrite=bool(cfg.overwrite))
 
     summary_rows: list[dict[str, Any]] = []
     dataset_id = 0
@@ -814,6 +808,7 @@ def generate(config: CancerGeneratorConfig | None = None, **overrides: Any) -> p
                 )
                 file_path = output_dir / file_name
                 save_pickle(pickle_map, file_path)
+                write_dataset_manifest(pickle_map, file_path, generator_config=dataclasses.asdict(cfg), generator_source=__file__)
 
                 one_step_rows = pickle_map["test_data"]["outcomes"].shape[0]
                 seq_rows = pickle_map["test_data_seq"]["outcomes"].shape[0]

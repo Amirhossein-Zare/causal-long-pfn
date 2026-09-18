@@ -4,6 +4,8 @@ import gc
 import logging
 import os
 import pickle
+import hashlib
+import json
 from pathlib import Path
 
 import numpy as np
@@ -20,9 +22,9 @@ from clpfn.config.defaults import (
 
 LOGGER = logging.getLogger(__name__)
 
-READY_FORMAT_VERSION = "causal_long_pfn_ready"
+READY_FORMAT_VERSION = "causal_long_pfn_ready_static_normalized"
 
-DEFAULT_OUTPUT_DIR = Path("outputs/pfn_ready/all_domains")
+DEFAULT_OUTPUT_DIR = Path("outputs/pfn_ready")
 
 PFN_MAX_CONTEXT = 250
 PFN_MAX_TEST_ROWS_PER_TASK = None
@@ -31,32 +33,49 @@ RANDOM_SEED = 2026
 TARGET_SENTINEL = HIDDEN_SENTINEL
 
 
-def clean_output_dir(output_dir=DEFAULT_OUTPUT_DIR) -> Path:
+def prepare_output_dir(output_dir=DEFAULT_OUTPUT_DIR, *, overwrite=False) -> Path:
     output_dir = Path(output_dir)
+    if output_dir.exists() and any(output_dir.iterdir()):
+        if not overwrite:
+            raise FileExistsError(f"Ready build directory already exists and is non-empty: {output_dir}. Use overwrite=True to replace it.")
+        for path in output_dir.glob("causal_long_pfn_ready_*.p"):
+            path.unlink()
+        for path in output_dir.glob("*manifest*.json"):
+            path.unlink()
     output_dir.mkdir(parents=True, exist_ok=True)
-
-    for stale_file in output_dir.glob("*.p"):
-        stale_file.unlink()
-
     return output_dir
 
 
-def support_anchor_candidates(Y_i, max_anchor, prefer_min_tobs=True):
-    max_anchor = int(max(1, min(max_anchor, common.MAX_TARGET_INDEX)))
-    lo = common.MIN_T_OBS + 1 if prefer_min_tobs and max_anchor >= common.MIN_T_OBS + 1 else 1
+def _sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
+
+def _write_json(path, value):
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(value, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+
+
+def support_anchor_candidates(Y_i, max_anchor):
+    max_anchor = int(max_anchor)
+    if not common.MIN_T_OBS + 1 <= max_anchor <= common.MAX_TARGET_INDEX:
+        raise ValueError(
+            f"Support anchor limit {max_anchor} is outside "
+            f"[{common.MIN_T_OBS + 1}, {common.MAX_TARGET_INDEX}]."
+        )
+    lo = common.MIN_T_OBS + 1
     candidates = np.arange(lo, max_anchor + 1, dtype=np.int64)
-    candidates = candidates[np.isfinite(Y_i[candidates])]
-
-    if candidates.size == 0 and lo > 1:
-        candidates = np.arange(1, max_anchor + 1, dtype=np.int64)
-        candidates = candidates[np.isfinite(Y_i[candidates])]
-
-    return candidates
+    return candidates[np.isfinite(Y_i[candidates])]
 
 
 def build_features_for_raw(raw, domain, cfg, state_mean, state_std, out_mean, out_std):
-    out_std = max(float(out_std), 1e-6)
+    out_std = float(out_std)
+    if out_std <= 0:
+        raise ValueError("Outcome standard deviation must be positive.")
     states = common.get_state_array(raw, domain, cfg)
     outcomes = common.get_outcome_array(raw, domain, cfg)
 
@@ -76,11 +95,13 @@ def build_features_for_raw(raw, domain, cfg, state_mean, state_std, out_mean, ou
 
     covariates_norm = ((covariates - state_mean) / np.maximum(state_std, 0.1)).astype(np.float32)
     np.clip(covariates_norm, -3.0, 3.0, out=covariates_norm)
-    covariates_norm[~np.isfinite(covariates_norm)] = 0.0
+    if not np.isfinite(covariates_norm).all():
+        raise ValueError(f"{domain} covariates contain non-finite normalized values.")
 
     y_norm = ((outcomes - out_mean) / out_std).astype(np.float32)
     y_norm = np.clip(y_norm, -common.OUTCOME_CLIP_TRAIN, common.OUTCOME_CLIP_TRAIN)
-    y_norm[~np.isfinite(y_norm)] = 0.0
+    if not np.isfinite(y_norm).all():
+        raise ValueError(f"{domain} outcomes contain non-finite normalized values.")
 
     x = np.concatenate([covariates_norm, y_norm[:, :, None]], axis=-1).astype(np.float32)
     d_input = int(x.shape[-1])
@@ -94,7 +115,9 @@ def build_features_for_raw(raw, domain, cfg, state_mean, state_std, out_mean, ou
     return x, d_input
 
 
-def make_support_context(raw_support, domain, cfg, rng, max_context=PFN_MAX_CONTEXT):
+def make_support_context(
+    raw_support, domain, cfg, rng, support_selection_seed, max_context=PFN_MAX_CONTEXT,
+):
     lengths = np.asarray(raw_support["sequence_lengths"], dtype=np.int64)
     actions = common.get_actions(raw_support, domain)
     outcomes = common.get_outcome_array(raw_support, domain, cfg)
@@ -106,12 +129,14 @@ def make_support_context(raw_support, domain, cfg, rng, max_context=PFN_MAX_CONT
     eligible = []
 
     for row_idx in range(n_total):
-        max_anchor = min(int(lengths[row_idx]), outcomes.shape[1] - 1, common.MAX_TARGET_INDEX)
+        max_anchor = min(int(lengths[row_idx]) - 1, outcomes.shape[1] - 1, common.MAX_TARGET_INDEX)
 
         if max_anchor < 1:
             continue
 
-        candidates = support_anchor_candidates(outcomes[row_idx], max_anchor, prefer_min_tobs=True)
+        if max_anchor < common.MIN_T_OBS + 1:
+            continue
+        candidates = support_anchor_candidates(outcomes[row_idx], max_anchor)
 
         if candidates.size > 0 and max_anchor >= common.MIN_T_OBS + 1:
             eligible.append(row_idx)
@@ -119,23 +144,9 @@ def make_support_context(raw_support, domain, cfg, rng, max_context=PFN_MAX_CONT
     eligible = np.asarray(eligible, dtype=np.int64)
 
     if len(eligible) == 0:
-        relaxed_eligible = []
-
-        for row_idx in range(n_total):
-            max_anchor = min(int(lengths[row_idx]), outcomes.shape[1] - 1, common.MAX_TARGET_INDEX)
-
-            if max_anchor < 1:
-                continue
-
-            candidates = support_anchor_candidates(outcomes[row_idx], max_anchor, prefer_min_tobs=False)
-
-            if candidates.size > 0:
-                relaxed_eligible.append(row_idx)
-
-        eligible = np.asarray(relaxed_eligible, dtype=np.int64)
-
-    if len(eligible) == 0:
-        eligible = np.arange(n_total, dtype=np.int64)
+        raise ValueError(
+            f"Support data has no row with a finite anchor at or after t={common.MIN_T_OBS + 1}."
+        )
 
     if len(eligible) > max_context:
         chosen = rng.choice(eligible, size=max_context, replace=False)
@@ -143,16 +154,17 @@ def make_support_context(raw_support, domain, cfg, rng, max_context=PFN_MAX_CONT
         chosen = eligible.copy()
 
     chosen = np.sort(chosen)
+    support_patient_ids = np.asarray(raw_support["patient_id"])[chosen].copy()
 
     model_normalizer_rows = chosen
-    state_mean, state_std, out_mean, out_std = common.compute_support_stats(
+    state_mean, state_std, static_mean, static_std, out_mean, out_std = common.compute_support_stats(
         raw_support,
         domain,
         cfg,
         model_normalizer_rows,
     )
     eval_normalizer_rows = np.arange(n_total, dtype=np.int64)
-    _, _, eval_out_mean, eval_out_std = common.compute_support_stats(
+    *_, eval_out_mean, eval_out_std = common.compute_support_stats(
         raw_support,
         domain,
         cfg,
@@ -181,63 +193,77 @@ def make_support_context(raw_support, domain, cfg, rng, max_context=PFN_MAX_CONT
     support_anchor_y = np.zeros((n_support, N_SUPPORT_ANCHORS), dtype=np.float32)
     support_anchor_time = np.ones((n_support, N_SUPPORT_ANCHORS), dtype=np.int64)
 
-    static_all = common.get_static_array(raw_support, n_total)
+    static_all = common.normalize_static_features(
+        common.get_static_array(raw_support, n_total), static_mean, static_std
+    )
     support_static = np.zeros((n_support, D_STATIC_MAX), dtype=np.float32)
 
     for support_idx, row_idx in enumerate(chosen):
         seq_len = int(lengths[row_idx])
-        valid_len = min(seq_len, raw_T, common.MAX_SEQ_LEN)
+        if not 1 <= seq_len <= raw_T:
+            raise ValueError(f"Support sequence length {seq_len} is outside [1, {raw_T}].")
+        valid_len = min(seq_len, common.MAX_SEQ_LEN)
+        support_x[support_idx, :valid_len, :] = x_all[row_idx, :valid_len, :]
 
-        if valid_len > 0:
-            support_x[support_idx, :valid_len, :] = x_all[row_idx, :valid_len, :]
-
-        action_len = min(actions.shape[1], common.MAX_SEQ_LEN)
+        action_len = min(valid_len, actions.shape[1], common.MAX_SEQ_LEN)
         support_actions[support_idx, :action_len] = actions[row_idx, :action_len]
         support_static[support_idx] = static_all[row_idx]
 
-        max_anchor = min(seq_len, raw_T - 1, outcomes.shape[1] - 1, common.MAX_TARGET_INDEX)
-        max_anchor = max(1, max_anchor)
-
-        candidates = support_anchor_candidates(outcomes[row_idx], max_anchor, prefer_min_tobs=True)
-
+        max_anchor = min(seq_len - 1, raw_T - 1, outcomes.shape[1] - 1, common.MAX_TARGET_INDEX)
+        candidates = support_anchor_candidates(outcomes[row_idx], max_anchor)
         if candidates.size == 0:
-            candidates = support_anchor_candidates(outcomes[row_idx], max_anchor, prefer_min_tobs=False)
-
-        if candidates.size == 0:
-            candidates = np.array([max_anchor], dtype=np.int64)
+            raise ValueError(f"Support row {row_idx} has no finite canonical anchor.")
 
         max_a = int(candidates.max())
         min_a = int(candidates.min())
         mid_a = int(max(min_a, min(max_a, (min_a + max_a) // 2)))
 
-        anchors = [max_a, mid_a, min_a, int(rng.choice(candidates))]
+        anchors = [max_a, mid_a, min_a]
+        while len(anchors) < N_SUPPORT_ANCHORS:
+            anchors.append(int(rng.choice(candidates)))
 
         for anchor_idx, anchor_time in enumerate(anchors[:N_SUPPORT_ANCHORS]):
-            anchor_time = int(max(min_a, min(int(anchor_time), max_a)))
-
-            if not np.isfinite(outcomes[row_idx, anchor_time]):
-                anchor_time = int(rng.choice(candidates))
+            anchor_time = int(anchor_time)
+            if anchor_time not in candidates:
+                raise ValueError(f"Support anchor {anchor_time} is not a valid candidate.")
 
             support_anchor_time[support_idx, anchor_idx] = anchor_time
             support_anchor_y[support_idx, anchor_idx] = np.float32(
                 np.clip(
-                    (float(outcomes[row_idx, anchor_time]) - out_mean) / max(float(out_std), 1e-6),
+                    (float(outcomes[row_idx, anchor_time]) - out_mean) / float(out_std),
                     -common.TARGET_NORM_CLIP,
                     common.TARGET_NORM_CLIP,
                 )
             )
+
+    state_observed = np.asarray(raw_support["state_observed_mask"], dtype=bool)[chosen]
+    outcome_observed = np.asarray(raw_support["outcome_observed_mask"], dtype=bool)[chosen]
+    support_state_observed_mask = np.zeros(
+        (n_support, common.MAX_SEQ_LEN, state_observed.shape[-1]),
+        dtype=bool,
+    )
+    support_outcome_observed_mask = np.zeros(
+        (n_support, common.MAX_SEQ_LEN),
+        dtype=bool,
+    )
+    mask_width = min(state_observed.shape[1], common.MAX_SEQ_LEN)
+    support_state_observed_mask[:, :mask_width] = state_observed[:, :mask_width]
+    support_outcome_observed_mask[:, :mask_width] = outcome_observed[:, :mask_width]
 
     return {
         "support_x": support_x,
         "support_actions": support_actions,
         "support_anchor_y": support_anchor_y,
         "support_anchor_time": support_anchor_time,
+        "support_raw_row_ids": chosen.copy(),
+        "support_patient_ids": support_patient_ids,
+        "support_selection_seed": int(support_selection_seed),
         "support_static": support_static,
+        "support_state_observed_mask": support_state_observed_mask,
+        "support_outcome_observed_mask": support_outcome_observed_mask,
 
         "n_support": int(n_support),
-        "n_ctx": int(n_support),
         "d_input": int(d_input),
-        "d": int(d_input),
 
         "out_mean": np.float32(out_mean),
         "out_std": np.float32(out_std),
@@ -246,12 +272,15 @@ def make_support_context(raw_support, domain, cfg, rng, max_context=PFN_MAX_CONT
 
         "state_mean": state_mean,
         "state_std": state_std,
+        "static_mean": static_mean,
+        "static_std": static_std,
 
         "support_rows_total": int(n_total),
         "support_rows_eligible": int(len(eligible)),
         "support_rows_used": int(n_support),
         "normalization_rows_used": int(len(model_normalizer_rows)),
         "normalization_scope": "pfn_context",
+        "static_normalization_scope": "pfn_context",
         "eval_normalization_rows_used": int(len(eval_normalizer_rows)),
         "eval_normalization_scope": "full_support",
     }
@@ -259,48 +288,25 @@ def make_support_context(raw_support, domain, cfg, rng, max_context=PFN_MAX_CONT
 
 def strip_private_support_stats(support_context):
     out = dict(support_context)
-    out.pop("state_mean", None)
-    out.pop("state_std", None)
+    del out["state_mean"]
+    del out["state_std"]
+    del out["static_mean"]
+    del out["static_std"]
     return out
 
 
 def make_query_task_ready(raw_query, rows, current_times, target_times, domain, cfg, support_context):
     d_input = int(support_context["d_input"])
 
-    if len(rows) == 0:
-        return {
-            "rows": np.zeros(0, dtype=np.int64),
-            "current_time": np.zeros(0, dtype=np.int64),
-            "current_t": np.zeros(0, dtype=np.int64),
-            "t_obs": np.zeros(0, dtype=np.int64),
-            "t_target": np.zeros(0, dtype=np.int64),
-            "tau": np.zeros(0, dtype=np.int64),
-
-            "query_x": np.full((0, common.MAX_SEQ_LEN, d_input), TARGET_SENTINEL, dtype=np.float32),
-            "query_actions": np.zeros((0, common.MAX_SEQ_LEN), dtype=np.int64),
-            "query_static": np.zeros((0, D_STATIC_MAX), dtype=np.float32),
-
-            "target_value": np.zeros(0, dtype=np.float32),
-            "target_raw": np.zeros(0, dtype=np.float32),
-            "target_y_norm": np.zeros(0, dtype=np.float32),
-            "target_model_norm": np.zeros(0, dtype=np.float32),
-            "target_eval_norm": np.zeros(0, dtype=np.float32),
-            "target_norm": np.zeros(0, dtype=np.float32),
-
-            "out_mean": np.float32(support_context["out_mean"]),
-            "out_std": np.float32(support_context["out_std"]),
-            "eval_out_mean": np.float32(support_context["eval_out_mean"]),
-            "eval_out_std": np.float32(support_context["eval_out_std"]),
-            "n_eval": 0,
-        }
-
     actions = common.get_actions(raw_query, domain)
     outcomes = common.get_outcome_array(raw_query, domain, cfg)
 
     out_mean = float(support_context["out_mean"])
-    out_std = max(float(support_context["out_std"]), 1e-6)
+    out_std = float(support_context["out_std"])
     eval_out_mean = float(support_context["eval_out_mean"])
-    eval_out_std = max(float(support_context["eval_out_std"]), 1e-6)
+    eval_out_std = float(support_context["eval_out_std"])
+    if out_std <= 0 or eval_out_std <= 0:
+        raise ValueError("Ready outcome standard deviations must be positive.")
 
     x_all, d_input = build_features_for_raw(
         raw=raw_query,
@@ -319,11 +325,27 @@ def make_query_task_ready(raw_query, rows, current_times, target_times, domain, 
     query_actions = np.zeros((n_rows, common.MAX_SEQ_LEN), dtype=np.int64)
     query_static = np.zeros((n_rows, D_STATIC_MAX), dtype=np.float32)
 
-    static_all = common.get_static_array(raw_query, outcomes.shape[0])
+    static_all = common.normalize_static_features(
+        common.get_static_array(raw_query, outcomes.shape[0]),
+        support_context["static_mean"],
+        support_context["static_std"],
+    )
 
-    target_value = np.zeros(n_rows, dtype=np.float32)
+    target_raw = np.zeros(n_rows, dtype=np.float32)
     target_model_norm = np.zeros(n_rows, dtype=np.float32)
     target_eval_norm = np.zeros(n_rows, dtype=np.float32)
+    current_y_raw = np.zeros(n_rows, dtype=np.float32)
+    current_y_model_norm = np.zeros(n_rows, dtype=np.float32)
+    current_y_eval_norm_unclipped = np.zeros(n_rows, dtype=np.float32)
+    current_y_eval_norm_reported = np.zeros(n_rows, dtype=np.float32)
+    current_y_observed = np.zeros(n_rows, dtype=bool)
+    target_observed = np.zeros(n_rows, dtype=bool)
+    target_path_raw = None
+    if "target_path_raw" in raw_query:
+        target_path_raw = np.asarray(raw_query["target_path_raw"], dtype=np.float32)[rows].copy()
+        target_path_model_norm = np.clip((target_path_raw - out_mean) / out_std, -common.TARGET_NORM_CLIP, common.TARGET_NORM_CLIP).astype(np.float32)
+        target_path_eval_norm_unclipped = ((target_path_raw - eval_out_mean) / eval_out_std).astype(np.float32)
+        target_path_eval_norm_reported = np.clip(target_path_eval_norm_unclipped, -common.TARGET_NORM_CLIP, common.TARGET_NORM_CLIP).astype(np.float32)
 
     t_obs = np.zeros(n_rows, dtype=np.int64)
     t_target = np.zeros(n_rows, dtype=np.int64)
@@ -336,11 +358,14 @@ def make_query_task_ready(raw_query, rows, current_times, target_times, domain, 
         current_time = int(current_times[out_idx])
         target_time = int(target_times[out_idx])
 
-        current_time = max(0, min(current_time, raw_T - 1, common.MAX_INPUT_INDEX))
-        target_time = max(1, min(target_time, raw_T - 1, common.MAX_TARGET_INDEX))
-
+        if not 0 <= current_time <= min(raw_T - 1, common.MAX_INPUT_INDEX):
+            raise ValueError(f"Current time {current_time} is outside the canonical query range.")
+        if not 1 <= target_time <= min(raw_T - 1, common.MAX_TARGET_INDEX):
+            raise ValueError(f"Target time {target_time} is outside the canonical query range.")
         if target_time <= current_time:
-            target_time = min(current_time + 1, raw_T - 1, common.MAX_TARGET_INDEX)
+            raise ValueError(
+                f"Target time {target_time} must be after current time {current_time}."
+            )
 
         visible_len = min(current_time + 1, raw_T, common.MAX_SEQ_LEN)
         query_x[out_idx, :visible_len, :] = x_all[row_id, :visible_len, :]
@@ -365,19 +390,50 @@ def make_query_task_ready(raw_query, rows, current_times, target_times, domain, 
             )
         )
 
-        target_value[out_idx] = np.float32(y_value)
+        target_raw[out_idx] = np.float32(y_value)
         target_model_norm[out_idx] = np.float32(y_model_norm)
         target_eval_norm[out_idx] = np.float32(y_eval_norm)
+        current_value = float(outcomes[row_id, current_time])
+        current_model_unclipped = (current_value - out_mean) / out_std
+        current_eval_unclipped = (current_value - eval_out_mean) / eval_out_std
+        current_y_raw[out_idx] = np.float32(current_value)
+        current_y_model_norm[out_idx] = np.float32(np.clip(current_model_unclipped, -common.TARGET_NORM_CLIP, common.TARGET_NORM_CLIP))
+        current_y_eval_norm_unclipped[out_idx] = np.float32(current_eval_unclipped)
+        current_y_eval_norm_reported[out_idx] = np.float32(np.clip(current_eval_unclipped, -common.TARGET_NORM_CLIP, common.TARGET_NORM_CLIP))
+        current_y_observed[out_idx] = bool(np.asarray(raw_query["outcome_observed_mask"])[row_id, current_time])
+        target_observed[out_idx] = bool(np.asarray(raw_query["outcome_observed_mask"])[row_id, target_time])
 
         current_time_out[out_idx] = current_time
         t_obs[out_idx] = current_time
         t_target[out_idx] = target_time
-        tau[out_idx] = max(1, target_time - current_time)
+        tau[out_idx] = target_time - current_time
 
-    return {
+    target_observed_path = None
+    if target_path_raw is not None:
+        source_mask = np.asarray(raw_query["outcome_observed_mask"], dtype=bool)
+        target_observed_path = np.zeros(target_path_raw.shape, dtype=bool)
+        for out_idx, row_id in enumerate(rows):
+            start = int(t_obs[out_idx]) + 1
+            stop = start + target_observed_path.shape[1]
+            target_observed_path[out_idx] = source_mask[int(row_id), start:stop]
+
+    raw_state_observed = np.asarray(raw_query["state_observed_mask"], dtype=bool)[rows]
+    raw_outcome_observed = np.asarray(raw_query["outcome_observed_mask"], dtype=bool)[rows]
+    query_state_observed_mask = np.zeros(
+        (n_rows, common.MAX_SEQ_LEN, raw_state_observed.shape[-1]),
+        dtype=bool,
+    )
+    query_outcome_observed_mask = np.zeros(
+        (n_rows, common.MAX_SEQ_LEN),
+        dtype=bool,
+    )
+    mask_width = min(raw_state_observed.shape[1], common.MAX_SEQ_LEN)
+    query_state_observed_mask[:, :mask_width] = raw_state_observed[:, :mask_width]
+    query_outcome_observed_mask[:, :mask_width] = raw_outcome_observed[:, :mask_width]
+
+    out = {
         "rows": rows.astype(np.int64),
         "current_time": current_time_out,
-        "current_t": current_time_out,
         "t_obs": t_obs,
         "t_target": t_target,
         "tau": tau,
@@ -386,12 +442,17 @@ def make_query_task_ready(raw_query, rows, current_times, target_times, domain, 
         "query_actions": query_actions,
         "query_static": query_static,
 
-        "target_value": target_value,
-        "target_raw": target_value,
-        "target_y_norm": target_model_norm,
+        "target_raw": target_raw,
         "target_model_norm": target_model_norm,
         "target_eval_norm": target_eval_norm,
-        "target_norm": target_eval_norm,
+        "current_y_raw": current_y_raw,
+        "current_y_model_norm": current_y_model_norm,
+        "current_y_eval_norm_unclipped": current_y_eval_norm_unclipped,
+        "current_y_eval_norm_reported": current_y_eval_norm_reported,
+        "current_y_observed": current_y_observed,
+        "target_observed": target_observed,
+        "query_state_observed_mask": query_state_observed_mask,
+        "query_outcome_observed_mask": query_outcome_observed_mask,
 
         "out_mean": np.float32(out_mean),
         "out_std": np.float32(out_std),
@@ -399,6 +460,29 @@ def make_query_task_ready(raw_query, rows, current_times, target_times, domain, 
         "eval_out_std": np.float32(eval_out_std),
         "n_eval": int(n_rows),
     }
+    identity_keys = ("dataset_uid", "original_row_id", "patient_id", "patient_uid", "origin_time", "origin_uid", "first_action", "plan_uid", "query_uid", "is_factual", "is_counterfactual", "planned_action_sequence", "factual_prefix_length", "max_horizon")
+    missing_identity = [key for key in identity_keys if key not in raw_query]
+    if missing_identity:
+        raise KeyError(f"Canonical benchmark query is missing identity fields: {missing_identity}")
+    for key in identity_keys:
+        out[key] = np.asarray(raw_query[key])[rows].copy()
+    if target_path_raw is not None:
+        endpoint = target_path_raw[np.arange(n_rows), tau - 1]
+        if not np.allclose(endpoint, target_raw, rtol=0.0, atol=0.0, equal_nan=False):
+            raise ValueError("Sequence target path endpoint differs from the existing horizon target.")
+        out.update({
+            "target_path_raw": target_path_raw,
+            "target_path_model_norm": target_path_model_norm,
+            "target_path_eval_norm_unclipped": target_path_eval_norm_unclipped,
+            "target_path_eval_norm_reported": target_path_eval_norm_reported,
+            "target_state_path_raw": np.asarray(raw_query["target_state_path_raw"], dtype=np.float32)[rows].copy(),
+            "target_observed_path": target_observed_path,
+            "target_path_normalizers": {
+                "model": {"identity": "support_context_outcome_clipped", "mean": out_mean, "std": out_std, "clip": common.TARGET_NORM_CLIP},
+                "evaluation": {"identity": "full_support_outcome_reported", "mean": eval_out_mean, "std": eval_out_std, "clip": common.TARGET_NORM_CLIP},
+            },
+        })
+    return out
 
 
 def build_ready_map_for_pickle(
@@ -422,8 +506,11 @@ def build_ready_map_for_pickle(
 
     dataset_id = int(pm["dataset_id"])
     support_size = int(pm["support_size"])
+    if dataset_id < 0:
+        raise ValueError("dataset_id must be non-negative.")
 
-    rng = np.random.default_rng(int(seed) + 100000 * int(global_dataset_id) + max(dataset_id, 0))
+    support_selection_seed = int(seed) + 100000 * int(global_dataset_id) + dataset_id
+    rng = np.random.default_rng(support_selection_seed)
 
     support_context = make_support_context(
         raw_support=support_raw,
@@ -431,6 +518,7 @@ def build_ready_map_for_pickle(
         cfg=cfg,
         rng=rng,
         max_context=pfn_max_context,
+        support_selection_seed=support_selection_seed,
     )
 
     tasks = {}
@@ -452,7 +540,7 @@ def build_ready_map_for_pickle(
         )
 
     if "one_step_cf_final" not in tasks:
-        return None, {"skipped": True, "reason": "missing_test_data"}
+        raise KeyError(f"Raw benchmark {pfile} has no one-step evaluation task.")
 
     gamma = pm["gamma"]
 
@@ -460,6 +548,7 @@ def build_ready_map_for_pickle(
         "ready_format_version": READY_FORMAT_VERSION,
         "global_dataset_id": int(global_dataset_id),
         "dataset_id": int(dataset_id),
+        "dataset_uid": str(pm["dataset_uid"]),
         "dataset_file": os.path.basename(pfile),
         "source_file": str(pfile),
 
@@ -475,13 +564,13 @@ def build_ready_map_for_pickle(
         "max_input_index": int(common.MAX_INPUT_INDEX),
         "max_target_index": int(common.MAX_TARGET_INDEX),
         "projection_horizon": int(common.PROJECTION_HORIZON),
+        "min_history_points": int(common.MIN_HISTORY_POINTS),
         "min_t_obs": int(common.MIN_T_OBS),
         "t_obs_semantics": "last_visible_index",
         "rollout_start_semantics": "start_current_time_equals_t_obs",
-        "model_family": "CausalLongPFN",
-        "ready_tensor_naming": "manuscript_support_query_names",
         "pfn_max_context": int(pfn_max_context),
         "pfn_max_test_rows_per_task": max_test_rows_per_task,
+        "n_support_anchors_built": int(N_SUPPORT_ANCHORS),
 
         "outcome_name": "outcomes",
         "state_name": "states",
@@ -505,12 +594,15 @@ def run_all(
     max_test_rows_per_task=PFN_MAX_TEST_ROWS_PER_TASK,
     output_dir=DEFAULT_OUTPUT_DIR,
     seed=RANDOM_SEED,
+    overwrite=False,
+    ready_build_id=None,
 ):
     output_dir = Path(output_dir)
 
     wanted_domains = common.WANTED_DOMAINS if wanted_domains is None else tuple(wanted_domains)
 
-    output_dir = clean_output_dir(output_dir)
+    output_dir = prepare_output_dir(output_dir, overwrite=overwrite)
+    ready_build_id = str(ready_build_id or output_dir.name)
 
     common.configure_torch_runtime(seed=seed)
 
@@ -520,7 +612,8 @@ def run_all(
 
     LOGGER.info(
         "Build CausalLongPFN-ready benchmark files | output_dir=%s | "
-        "raw_pickles=%s | wanted_domains=%s | pfn_max_context=%s | max_test_rows_per_task=%s",
+        "raw_pickles=%s | wanted_domains=%s | pfn_max_context=%s | "
+        "max_test_rows_per_task=%s",
         output_dir,
         len(raw_files),
         wanted_domains,
@@ -549,13 +642,13 @@ def run_all(
             max_test_rows_per_task=max_test_rows_per_task,
         )
 
-        if info.get("skipped", False):
+        if info["skipped"]:
             skipped.append({
                 "source_file": os.path.basename(pfile),
                 "source_path": str(pfile),
-                "reason": info.get("reason", "skipped"),
+                "reason": info["reason"],
             })
-            LOGGER.info("Skipped %s: %s", os.path.basename(pfile), info.get("reason", "skipped"))
+            LOGGER.info("Skipped %s: %s", os.path.basename(pfile), info["reason"])
             continue
 
         out_file = output_dir / (
@@ -564,10 +657,29 @@ def run_all(
         )
 
         ready_map["ready_file"] = out_file.name
+        ready_map["ready_build_id"] = ready_build_id
 
         with open(out_file, "wb") as f:
             pickle.dump(ready_map, f, protocol=pickle.HIGHEST_PROTOCOL)
 
+        raw_hash = _sha256_file(pfile)
+        ready_hash = _sha256_file(out_file)
+        raw_manifest_path = Path(pfile).parent / f"benchmark_dataset_manifest_{ready_map['dataset_uid']}.json"
+        if not raw_manifest_path.exists():
+            raise FileNotFoundError(f"Raw dataset manifest is required for ready construction: {raw_manifest_path}")
+        dataset_manifest = {
+            **json.loads(raw_manifest_path.read_text(encoding="utf-8")),
+            "ready_build_id": ready_build_id,
+            "ready_file": str(out_file), "ready_file_hash": ready_hash,
+            "support_patient_count": int(len(np.unique(ready_map["support_context"]["support_patient_ids"]))),
+            "query_patient_count": int(len(np.unique(np.concatenate([task["patient_id"] for task in ready_map["tasks"].values()])))),
+            "origin_count": int(len(np.unique(np.concatenate([task["origin_uid"] for task in ready_map["tasks"].values()])))),
+            "plan_count": int(len(np.unique(np.concatenate([task["plan_uid"] for task in ready_map["tasks"].values()])))),
+            "one_step_query_count": int(ready_map["tasks"]["one_step_cf_final"]["n_eval"]),
+            "sequence_query_count": int(sum(task["n_eval"] for name, task in ready_map["tasks"].items() if name.startswith("seq_"))),
+            "maximum_sequence_horizon": int(common.PROJECTION_HORIZON),
+        }
+        _write_json(output_dir / f"ready_dataset_manifest_{ready_map['dataset_uid']}.json", dataset_manifest)
         ready_files.append(str(out_file))
 
         task_summary = ", ".join(
@@ -600,6 +712,13 @@ def run_all(
 
     if len(ready_files) == 0:
         raise RuntimeError("No CausalLongPFN-ready files were produced.")
+
+    _write_json(output_dir / "ready_build_manifest.json", {
+        "ready_build_id": ready_build_id,
+        "output_dir": str(output_dir),
+        "ready_files": ready_files,
+        "dataset_manifest_files": sorted(str(path) for path in output_dir.glob("ready_dataset_manifest_*.json")),
+    })
 
     return {
         "ready_files": ready_files,

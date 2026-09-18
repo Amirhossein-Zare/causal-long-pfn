@@ -1,14 +1,4 @@
-"""Factual MIMIC-III rolling-origin benchmark generator.
-
-MIMIC-III does not expose outcomes under unobserved interventions, so this
-generator exports factual prediction rows under the observed vasopressor and
-ventilation actions. The output uses the same canonical benchmark raw-pickle schema as
-the branchable simulated domains, allowing PFN and baseline evaluators to share
-one input contract.
-
-The HDF5 file is loaded inside ``generate`` rather than at import time so that
-the package can be imported without credentialed MIMIC assets on disk.
-"""
+"""Factual MIMIC-III rolling-origin benchmark generator."""
 
 from __future__ import annotations
 
@@ -21,7 +11,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from .common import concat_raw, ensure_output_dir, save_pickle, standardize_pickle_map, take_rows
+from .common import ensure_output_dir, save_pickle, standardize_pickle_map, write_dataset_manifest
 
 LOGGER = logging.getLogger(__name__)
 
@@ -30,10 +20,11 @@ LOGGER = logging.getLogger(__name__)
 class MIMICGeneratorConfig:
     input_root: str = "data/raw"
     merged_dataset_slug: str = "mimic-iii-extract-session2-merged"
-    output_dir: str = "outputs/data/mimic"
-    gammas: tuple[int, ...] = (1, 2, 3, 4, 5, 6, 7, 8, 9, 10)
+    output_dir: str = "outputs/benchmarks/mimic"
+    overwrite: bool = False
+    gammas: tuple[int, ...] = (1, 3, 5, 7, 9)
     support_sizes: tuple[int, ...] = (40, 80, 160, 320, 500)
-    reps_per_cell: int = 2
+    reps_per_cell: int = 1
     test_base_patients: int = 1
     seq_length: int = 60
     projection_horizon: int = 5
@@ -43,33 +34,47 @@ class MIMICGeneratorConfig:
     base_seed: int = 4000
 
     @classmethod
-    def from_dict(cls, values: dict[str, Any] | None = None, **overrides: Any) -> "MIMICGeneratorConfig":
+    def from_dict(cls, values: dict[str, Any] | None = None) -> "MIMICGeneratorConfig":
         values = dict(values or {})
-        values.update({k: v for k, v in overrides.items() if v is not None})
         valid = {field.name for field in dataclasses.fields(cls)}
-        return cls(**{k: v for k, v in values.items() if k in valid})
+        unknown = sorted(set(values) - valid)
+        if unknown:
+            raise KeyError(f"Unknown MIMIC generator configuration keys: {unknown}")
+        return cls(**values)
 
     def __post_init__(self) -> None:
         self.gammas = tuple(int(x) for x in self.gammas)
         self.support_sizes = tuple(int(x) for x in self.support_sizes)
         if self.total_seq_length is None:
             self.total_seq_length = int(self.seq_length) + int(self.projection_horizon)
+        if not self.gammas or any(gamma < 0 for gamma in self.gammas):
+            raise ValueError("gammas must contain non-negative values.")
+        if not self.support_sizes or any(size < 1 for size in self.support_sizes):
+            raise ValueError("support_sizes must contain positive values.")
+        if self.reps_per_cell < 1 or self.test_base_patients < 1:
+            raise ValueError("reps_per_cell and test_base_patients must be positive.")
+        if self.seq_length < 2 or self.projection_horizon < 1:
+            raise ValueError("seq_length must exceed one and projection_horizon must be positive.")
+        if not 1 <= self.min_t_obs < self.seq_length:
+            raise ValueError("min_t_obs must be within the generated sequence.")
+        if self.projection_horizon >= self.seq_length - self.min_t_obs:
+            raise ValueError("The sequence must contain a complete projection after min_t_obs.")
+        if self.total_seq_length != self.seq_length + self.projection_horizon:
+            raise ValueError("total_seq_length must equal seq_length plus projection_horizon.")
+        if self.n_seq_random_trajectories != 1:
+            raise ValueError("MIMIC has exactly one observed trajectory per query.")
 
 
-# ============================================================
 # Default generator grid
-# ============================================================
 
 INPUT_ROOT = "data/raw"
 MERGED_DATASET_SLUG = "mimic-iii-extract-session2-merged"
 
-OUTPUT_DIR = "outputs/data/mimic"
+OUTPUT_DIR = "outputs/benchmarks/mimic"
 
-# Gamma is retained as a benchmark stratification field for compatibility with
-# the simulated domains. It does not alter observed MIMIC trajectories.
-GAMMAS = [1,2,3,4,5,6,7,8,9,10]
+GAMMAS = [1, 3, 5, 7, 9]
 SUPPORT_SIZES = [40, 80, 160, 320, 500]
-REPS_PER_CELL = 2
+REPS_PER_CELL = 1
 
 TEST_BASE_PATIENTS = 1
 
@@ -104,29 +109,23 @@ TREATMENT_LIST = ["vaso", "vent"]
 STATIC_LIST = ["gender", "ethnicity", "age"]
 D_STATIC_MAX = 5
 
-# ============================================================
 # MIMIC loading helpers
-# ============================================================
 
 def find_merged_h5() -> Path:
-    candidates = list(Path(INPUT_ROOT).rglob("all_hourly_data.h5"))
-    hits = [p for p in candidates if MERGED_DATASET_SLUG in str(p)]
-
+    hits = sorted(
+        path
+        for path in Path(INPUT_ROOT).rglob("all_hourly_data.h5")
+        if MERGED_DATASET_SLUG in str(path)
+    )
     if not hits:
-        # Fallback: use the only all_hourly_data.h5 if there is exactly one.
-        if len(candidates) == 1:
-            return candidates[0]
-
         raise FileNotFoundError(
             f"Could not find all_hourly_data.h5 for mounted dataset slug "
-            f"'{MERGED_DATASET_SLUG}'. Found candidates: {candidates[:5]}"
+            f"'{MERGED_DATASET_SLUG}' under {INPUT_ROOT}."
         )
-
     if len(hits) > 1:
-        LOGGER.info("Multiple matching MIMIC H5 files found; using first:")
-        for p in hits:
-            LOGGER.info("  %s", p)
-
+        raise RuntimeError(
+            f"Expected one MIMIC H5 file for slug '{MERGED_DATASET_SLUG}', found: {hits}"
+        )
     return hits[0]
 
 
@@ -150,10 +149,6 @@ def grouped_ffill(df: pd.DataFrame, group_levels, limit=None) -> pd.DataFrame:
     return df.groupby(level=group_levels, sort=False).ffill(limit=limit)
 
 
-def grouped_bfill(df: pd.DataFrame, group_levels, limit=None) -> pd.DataFrame:
-    return df.groupby(level=group_levels, sort=False).bfill(limit=limit)
-
-
 def process_static_features_ct(static_features: pd.DataFrame, drop_first: bool = False) -> pd.DataFrame:
     processed = []
 
@@ -161,13 +156,7 @@ def process_static_features_ct(static_features: pd.DataFrame, drop_first: bool =
         s = static_features[feature]
 
         if pd.api.types.is_numeric_dtype(s):
-            mean = float(np.nanmean(s))
-            std = float(np.nanstd(s))
-
-            if std == 0.0 or not np.isfinite(std):
-                std = 1.0
-
-            processed.append(((s - mean) / std).rename(feature))
+            processed.append(pd.to_numeric(s, errors="coerce").rename(feature))
         else:
             oh = pd.get_dummies(
                 s.astype("string"),
@@ -206,11 +195,6 @@ def choose_static_columns(static_ct: pd.DataFrame, max_cols: int = D_STATIC_MAX)
     return chosen
 
 
-def filter_min_tobs(raw, min_tobs=MIN_T_OBS):
-    keep = np.where(np.asarray(raw["sequence_lengths"], dtype=np.int64) >= int(min_tobs))[0]
-    return take_rows(raw, keep), keep
-
-
 def exclude_support_ids(eligible, support_patient_ids, label):
     eligible = np.setdiff1d(
         np.asarray(eligible, dtype=np.int64),
@@ -243,8 +227,7 @@ def get_scaling_params(sim):
             means["states"] = vals.mean(axis=0)
             stds["states"] = np.maximum(vals.std(axis=0), 1e-6)
         else:
-            means["states"] = np.zeros(D_STATE, dtype=np.float32)
-            stds["states"] = np.ones(D_STATE, dtype=np.float32)
+            raise ValueError("MIMIC support data has no state observations.")
 
     if "mimic_outcome" in sim:
         vals = []
@@ -259,8 +242,7 @@ def get_scaling_params(sim):
             means["mimic_outcome"] = float(np.mean(vals))
             stds["mimic_outcome"] = float(max(np.std(vals), 1e-6))
         else:
-            means["mimic_outcome"] = 0.0
-            stds["mimic_outcome"] = 1.0
+            raise ValueError("MIMIC support data has no outcome observations.")
 
     if "static_features" in sim:
         sf = np.asarray(sim["static_features"], dtype=np.float32)
@@ -268,15 +250,12 @@ def get_scaling_params(sim):
             means["static_features"] = sf.mean(axis=0)
             stds["static_features"] = np.maximum(sf.std(axis=0), 1e-6)
         else:
-            means["static_features"] = np.zeros(D_STATIC_MAX, dtype=np.float32)
-            stds["static_features"] = np.ones(D_STATIC_MAX, dtype=np.float32)
+            raise ValueError("MIMIC support data has no static observations.")
 
     return pd.Series(means), pd.Series(stds)
 
 
-# ============================================================
 # Build fixed MIMIC arrays once
-# ============================================================
 
 def load_mimic_arrays():
     input_h5 = find_merged_h5()
@@ -310,11 +289,8 @@ def load_mimic_arrays():
     LOGGER.info("MIMIC hour level: %s", hour_level)
 
     time_series_raw = vitals_labs_mean[BASE_STATE_COLS].sort_index()
+    observed_mask = time_series_raw.notna()
     time_series_dense = grouped_ffill(time_series_raw, group_levels=group_levels)
-    time_series_dense = grouped_bfill(time_series_dense, group_levels=group_levels)
-
-    global_medians = time_series_dense.median(axis=0, skipna=True)
-    global_medians = global_medians.replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
     treatments = interventions[TREATMENT_LIST].sort_index()
     action4_df = (
@@ -342,17 +318,15 @@ def load_mimic_arrays():
     outcome_total = np.full((n_stays, TOTAL_SEQ_LENGTH), np.nan, dtype=np.float32)
     actions_total = np.zeros((n_stays, TOTAL_SEQ_LENGTH), dtype=np.int64)
     sequence_len_arr = np.zeros(n_stays, dtype=np.int64)
-    static_arr = np.zeros((n_stays, D_STATIC_MAX), dtype=np.float32)
+    static_arr = np.full((n_stays, D_STATIC_MAX), np.nan, dtype=np.float32)
+    state_observed_mask_total = np.zeros((n_stays, TOTAL_SEQ_LENGTH, D_STATE), dtype=bool)
+    outcome_observed_mask_total = np.zeros((n_stays, TOTAL_SEQ_LENGTH), dtype=bool)
 
     state_pos = time_series_dense.groupby(level=group_levels, sort=False).indices
+    observed_pos = observed_mask.groupby(level=group_levels, sort=False).indices
     action_pos = action4_df.groupby(level=group_levels, sort=False).indices
 
-    static_aligned = (
-        static_ct
-        .reindex(stay_index)
-        .replace([np.inf, -np.inf], np.nan)
-        .fillna(0.0)
-    )
+    static_aligned = static_ct.reindex(stay_index).replace([np.inf, -np.inf], np.nan)
 
     static_vals = static_aligned.to_numpy(dtype=np.float32)
     static_arr[:, :min(static_vals.shape[1], D_STATIC_MAX)] = static_vals[:, :D_STATIC_MAX]
@@ -376,6 +350,9 @@ def load_mimic_arrays():
 
             states_total[i, hrs, :] = vals
             outcome_total[i, hrs] = vals[:, TARGET_IDX]
+            direct = observed_mask.iloc[observed_pos[key]].to_numpy(dtype=bool)[keep]
+            state_observed_mask_total[i, hrs, :] = direct
+            outcome_observed_mask_total[i, hrs] = direct[:, TARGET_IDX]
 
         if key in action_pos:
             g = action4_df.iloc[action_pos[key]]
@@ -393,16 +370,7 @@ def load_mimic_arrays():
         if (i + 1) % 5000 == 0:
             LOGGER.info("Processed %s/%s MIMIC stays.", i + 1, n_stays)
 
-    med = global_medians[BASE_STATE_COLS].to_numpy(dtype=np.float32)
-
-    for j in range(D_STATE):
-        bad = ~np.isfinite(states_total[:, :, j])
-        states_total[:, :, j][bad] = med[j]
-
-    outcome_total = states_total[:, :, TARGET_IDX].astype(np.float32)
-
     actions_total = np.clip(actions_total, 0, N_ACTIONS - 1).astype(np.int64)
-    static_arr[~np.isfinite(static_arr)] = 0.0
 
     support_eligible = np.where(sequence_len_arr >= SEQ_LENGTH)[0]
 
@@ -425,20 +393,60 @@ def load_mimic_arrays():
         "input_h5": str(input_h5),
         "states_total": states_total,
         "outcome_total": outcome_total,
+        "state_observed_mask_total": state_observed_mask_total,
+        "outcome_observed_mask_total": outcome_observed_mask_total,
         "actions_total": actions_total,
         "static_arr": static_arr,
         "sequence_lengths": sequence_len_arr,
         "support_eligible": support_eligible.astype(np.int64),
         "seq_eligible": seq_eligible.astype(np.int64),
         "static_cols_used": [str(c) for c in static_cols_used],
+        "static_continuous_columns": [str(c) for c in static_cols_used if str(c) in STATIC_LIST and pd.api.types.is_numeric_dtype(static_ct[c])],
     }
 
 
-MIMIC = None  
+MIMIC = None
 
-# ============================================================
 # Raw construction functions
-# ============================================================
+
+def fit_mimic_preprocessing(support_patient_ids, dataset_uid):
+    ids = np.asarray(support_patient_ids, dtype=np.int64)
+    states = MIMIC["states_total"][ids, :SEQ_LENGTH, :]
+    mask = MIMIC["state_observed_mask_total"][ids, :SEQ_LENGTH, :]
+    lengths = np.minimum(MIMIC["sequence_lengths"][ids], SEQ_LENGTH)
+    valid = np.arange(states.shape[1])[None, :] < lengths[:, None]
+    medians = np.zeros(D_STATE, dtype=np.float32)
+    for j, feature in enumerate(BASE_STATE_COLS):
+        values = states[:, :, j][mask[:, :, j] & valid & np.isfinite(states[:, :, j])]
+        if values.size == 0:
+            raise ValueError(f"MIMIC support-only imputation has no observed value: dataset_uid={dataset_uid}, feature={feature}, support_patient_ids={ids.tolist()}")
+        medians[j] = np.float32(np.median(values))
+    static = MIMIC["static_arr"][ids].copy()
+    continuous = [i for i, name in enumerate(MIMIC["static_cols_used"]) if name in MIMIC["static_continuous_columns"]]
+    means, stds = [], []
+    for col in continuous:
+        values = static[:, col][np.isfinite(static[:, col])]
+        if values.size == 0:
+            raise ValueError(f"MIMIC support-only static normalization has no finite value: dataset_uid={dataset_uid}, feature={MIMIC['static_cols_used'][col]}, support_patient_ids={ids.tolist()}")
+        means.append(float(np.mean(values)))
+        stds.append(float(max(np.std(values), 1e-6)))
+    return {"state_imputation_medians": medians, "static_continuous_columns": continuous, "static_continuous_means": np.asarray(means, dtype=np.float32), "static_continuous_stds": np.asarray(stds, dtype=np.float32), "support_patient_ids": ids, "imputation_policy": "within_stay_forward_fill_then_support_observed_median"}
+
+
+def apply_mimic_preprocessing(raw, preprocessing):
+    out = dict(raw)
+    states = np.asarray(out["states"], dtype=np.float32).copy()
+    bad = ~np.isfinite(states)
+    states[bad] = np.broadcast_to(preprocessing["state_imputation_medians"], states.shape)[bad]
+    out["states"] = states
+    out["mimic_outcome"] = states[:, :, TARGET_IDX].copy()
+    static = np.asarray(out["static_features"], dtype=np.float32).copy()
+    for idx, mean, std in zip(preprocessing["static_continuous_columns"], preprocessing["static_continuous_means"], preprocessing["static_continuous_stds"]):
+        static[:, idx] = (np.where(np.isfinite(static[:, idx]), static[:, idx], mean) - mean) / std
+    if not np.isfinite(static).all():
+        raise ValueError("MIMIC categorical static features contain missing values.")
+    out["static_features"] = static
+    return out
 
 def make_factual_raw_from_patient_ids(patient_ids, length=SEQ_LENGTH):
     patient_ids = np.asarray(patient_ids, dtype=np.int64)
@@ -447,20 +455,25 @@ def make_factual_raw_from_patient_ids(patient_ids, length=SEQ_LENGTH):
     outcomes = MIMIC["outcome_total"][patient_ids, :length].astype(np.float32)
     actions = MIMIC["actions_total"][patient_ids, :length].astype(np.int64)
     static_features = MIMIC["static_arr"][patient_ids].astype(np.float32)
+    state_observed_mask = MIMIC["state_observed_mask_total"][patient_ids, :length, :].astype(bool)
+    outcome_observed_mask = MIMIC["outcome_observed_mask_total"][patient_ids, :length].astype(bool)
 
     sequence_lengths = np.minimum(
         MIMIC["sequence_lengths"][patient_ids],
         length,
     ).astype(np.int64)
 
-    return {
+    raw = {
         "states": states,
         "mimic_outcome": outcomes,
         "actions": actions,
         "sequence_lengths": sequence_lengths,
         "static_features": static_features,
         "patient_ids": patient_ids.astype(np.int64),
+        "state_observed_mask": state_observed_mask,
+        "outcome_observed_mask": outcome_observed_mask,
     }
+    return raw
 
 
 def make_support_data(rng, support_size):
@@ -472,39 +485,17 @@ def make_support_data(rng, support_size):
         )
 
     chosen = rng.choice(eligible, size=support_size, replace=False)
-    raw = make_factual_raw_from_patient_ids(chosen, length=SEQ_LENGTH)
-    raw, keep = filter_min_tobs(raw, min_tobs=MIN_T_OBS)
-
-    if raw["states"].shape[0] < support_size:
-        remaining = np.setdiff1d(eligible, chosen)
-        chunks = [raw]
-        n_kept = raw["states"].shape[0]
-
-        while n_kept < support_size:
-            extra_n = min(max(support_size, 50), len(remaining))
-            if extra_n <= 0:
-                raise RuntimeError("Could not refill MIMIC support after min_tobs filtering.")
-
-            extra_ids = rng.choice(remaining, size=extra_n, replace=False)
-            remaining = np.setdiff1d(remaining, extra_ids)
-
-            extra = make_factual_raw_from_patient_ids(extra_ids, length=SEQ_LENGTH)
-            extra, _ = filter_min_tobs(extra, min_tobs=MIN_T_OBS)
-
-            chunks.append(extra)
-            n_kept += extra["states"].shape[0]
-
-        raw = concat_raw(chunks)
-
-    return take_rows(raw, np.arange(support_size))
+    return make_factual_raw_from_patient_ids(chosen, length=SEQ_LENGTH)
 
 
-def simulate_one_step_factual_rows(patient_ids, min_tobs=MIN_T_OBS):
+def simulate_one_step_factual_rows(patient_ids, preprocessing, min_tobs=MIN_T_OBS):
     patient_ids = np.asarray(patient_ids, dtype=np.int64)
     max_rows = len(patient_ids) * SEQ_LENGTH
 
     states = np.zeros((max_rows, SEQ_LENGTH, D_STATE), dtype=np.float32)
     outcomes = np.zeros((max_rows, SEQ_LENGTH), dtype=np.float32)
+    state_observed_mask = np.zeros((max_rows, SEQ_LENGTH, D_STATE), dtype=bool)
+    outcome_observed_mask = np.zeros((max_rows, SEQ_LENGTH), dtype=bool)
     actions = np.zeros((max_rows, SEQ_LENGTH), dtype=np.int64)
     sequence_lengths = np.zeros(max_rows, dtype=np.int64)
 
@@ -520,8 +511,11 @@ def simulate_one_step_factual_rows(patient_ids, min_tobs=MIN_T_OBS):
         if seq_len < min_tobs + 1:
             continue
 
-        src_states = MIMIC["states_total"][pid, :SEQ_LENGTH, :]
-        src_outcomes = MIMIC["outcome_total"][pid, :SEQ_LENGTH]
+        src_states = MIMIC["states_total"][pid, :SEQ_LENGTH, :].copy()
+        bad = ~np.isfinite(src_states)
+        imputed = np.broadcast_to(preprocessing["state_imputation_medians"], src_states.shape)
+        src_states[bad] = imputed[bad]
+        src_outcomes = src_states[:, TARGET_IDX]
         src_actions = MIMIC["actions_total"][pid, :SEQ_LENGTH]
         src_static = MIMIC["static_arr"][pid]
 
@@ -536,6 +530,8 @@ def simulate_one_step_factual_rows(patient_ids, min_tobs=MIN_T_OBS):
 
             states[row] = src_states
             outcomes[row] = src_outcomes
+            state_observed_mask[row] = MIMIC["state_observed_mask_total"][pid, :SEQ_LENGTH]
+            outcome_observed_mask[row] = MIMIC["outcome_observed_mask_total"][pid, :SEQ_LENGTH]
             actions[row] = src_actions
 
             sequence_lengths[row] = int(t) + 1
@@ -545,7 +541,7 @@ def simulate_one_step_factual_rows(patient_ids, min_tobs=MIN_T_OBS):
 
             row += 1
 
-    return {
+    raw = {
         "states": states[:row],
         "mimic_outcome": outcomes[:row],
         "actions": actions[:row],
@@ -553,11 +549,15 @@ def simulate_one_step_factual_rows(patient_ids, min_tobs=MIN_T_OBS):
         "static_features": static_features[:row],
         "patient_ids_all_trajectories": patient_ids_all[:row],
         "patient_current_t": patient_current_t[:row],
+        "state_observed_mask": state_observed_mask[:row],
+        "outcome_observed_mask": outcome_observed_mask[:row],
     }
+    return apply_mimic_preprocessing(raw, preprocessing)
 
 
 def simulate_sequence_factual_rows(
     patient_ids,
+    preprocessing,
     projection_horizon=PROJECTION_HORIZON,
     min_tobs=MIN_T_OBS,
 ):
@@ -566,6 +566,8 @@ def simulate_sequence_factual_rows(
 
     states = np.zeros((max_rows, TOTAL_SEQ_LENGTH, D_STATE), dtype=np.float32)
     outcomes = np.zeros((max_rows, TOTAL_SEQ_LENGTH), dtype=np.float32)
+    state_observed_mask = np.zeros((max_rows, TOTAL_SEQ_LENGTH, D_STATE), dtype=bool)
+    outcome_observed_mask = np.zeros((max_rows, TOTAL_SEQ_LENGTH), dtype=bool)
     actions = np.zeros((max_rows, TOTAL_SEQ_LENGTH), dtype=np.int64)
     sequence_lengths = np.zeros(max_rows, dtype=np.int64)
 
@@ -581,8 +583,11 @@ def simulate_sequence_factual_rows(
         if seq_len < min_tobs + projection_horizon:
             continue
 
-        src_states = MIMIC["states_total"][pid, :TOTAL_SEQ_LENGTH, :]
-        src_outcomes = MIMIC["outcome_total"][pid, :TOTAL_SEQ_LENGTH]
+        src_states = MIMIC["states_total"][pid, :TOTAL_SEQ_LENGTH, :].copy()
+        bad = ~np.isfinite(src_states)
+        imputed = np.broadcast_to(preprocessing["state_imputation_medians"], src_states.shape)
+        src_states[bad] = imputed[bad]
+        src_outcomes = src_states[:, TARGET_IDX]
         src_actions = MIMIC["actions_total"][pid, :TOTAL_SEQ_LENGTH]
         src_static = MIMIC["static_arr"][pid]
 
@@ -599,6 +604,8 @@ def simulate_sequence_factual_rows(
 
             states[row] = src_states
             outcomes[row] = src_outcomes
+            state_observed_mask[row] = MIMIC["state_observed_mask_total"][pid, :TOTAL_SEQ_LENGTH]
+            outcome_observed_mask[row] = MIMIC["outcome_observed_mask_total"][pid, :TOTAL_SEQ_LENGTH]
             actions[row] = src_actions
 
             patient_ids_all[row] = int(pid)
@@ -609,7 +616,7 @@ def simulate_sequence_factual_rows(
 
             row += 1
 
-    return {
+    raw = {
         "states": states[:row],
         "mimic_outcome": outcomes[:row],
         "actions": actions[:row],
@@ -617,63 +624,51 @@ def simulate_sequence_factual_rows(
         "static_features": static_features[:row],
         "patient_ids_all_trajectories": patient_ids_all[:row],
         "patient_current_t": patient_current_t[:row],
+        "state_observed_mask": state_observed_mask[:row],
+        "outcome_observed_mask": outcome_observed_mask[:row],
     }
+    return apply_mimic_preprocessing(raw, preprocessing)
 
 
-# ============================================================
 # Valid-data wrappers
-# ============================================================
 
-def make_valid_factual_test_data(rng, support_patient_ids, max_attempts=500):
+def make_factual_test_data(rng, support_patient_ids, preprocessing):
     eligible = exclude_support_ids(MIMIC["support_eligible"], support_patient_ids, "factual test")
-
-    for attempt in range(max_attempts):
-        ids = rng.choice(eligible, size=TEST_BASE_PATIENTS, replace=False)
-        raw = make_factual_raw_from_patient_ids(ids, length=SEQ_LENGTH)
-        raw, keep = filter_min_tobs(raw, min_tobs=MIN_T_OBS)
-
-        if raw["states"].shape[0] > 0:
-            return raw, attempt + 1
-
-    raise RuntimeError("Could not generate non-empty MIMIC factual test data.")
+    ids = rng.choice(eligible, size=TEST_BASE_PATIENTS, replace=False)
+    return apply_mimic_preprocessing(
+        make_factual_raw_from_patient_ids(ids, length=SEQ_LENGTH),
+        preprocessing,
+    )
 
 
-def make_valid_one_step_test_data(rng, support_patient_ids, max_attempts=500):
+def make_one_step_test_data(rng, support_patient_ids, preprocessing):
     eligible = exclude_support_ids(MIMIC["support_eligible"], support_patient_ids, "one-step test")
-
-    for attempt in range(max_attempts):
-        ids = rng.choice(eligible, size=TEST_BASE_PATIENTS, replace=False)
-        raw = simulate_one_step_factual_rows(
-            patient_ids=ids,
-            min_tobs=MIN_T_OBS,
-        )
-
-        if raw["states"].shape[0] > 0:
-            return raw, attempt + 1
-
-    raise RuntimeError("Could not generate non-empty MIMIC one-step test_data.")
+    ids = rng.choice(eligible, size=TEST_BASE_PATIENTS, replace=False)
+    raw = simulate_one_step_factual_rows(
+        patient_ids=ids,
+        min_tobs=MIN_T_OBS,
+        preprocessing=preprocessing,
+    )
+    if raw["states"].shape[0] == 0:
+        raise RuntimeError("MIMIC one-step query construction produced no rows.")
+    return raw
 
 
-def make_valid_seq_test_data(rng, support_patient_ids, max_attempts=500):
+def make_sequence_test_data(rng, support_patient_ids, preprocessing):
     eligible = exclude_support_ids(MIMIC["seq_eligible"], support_patient_ids, "sequence test")
-
-    for attempt in range(max_attempts):
-        ids = rng.choice(eligible, size=TEST_BASE_PATIENTS, replace=False)
-        raw = simulate_sequence_factual_rows(
-            patient_ids=ids,
-            projection_horizon=PROJECTION_HORIZON,
-            min_tobs=MIN_T_OBS,
-        )
-
-        if raw["states"].shape[0] > 0:
-            return raw, attempt + 1
-
-    raise RuntimeError("Could not generate non-empty MIMIC sequence test_data_seq.")
+    ids = rng.choice(eligible, size=TEST_BASE_PATIENTS, replace=False)
+    raw = simulate_sequence_factual_rows(
+        patient_ids=ids,
+        projection_horizon=PROJECTION_HORIZON,
+        min_tobs=MIN_T_OBS,
+        preprocessing=preprocessing,
+    )
+    if raw["states"].shape[0] == 0:
+        raise RuntimeError("MIMIC sequence query construction produced no rows.")
+    return raw
 
 
-# ============================================================
 # Dataset assembly
-# ============================================================
 
 def make_dataset(dataset_id, gamma, support_size, rep, seed):
     rng = np.random.default_rng(seed)
@@ -695,18 +690,23 @@ def make_dataset(dataset_id, gamma, support_size, rep, seed):
         support_size=support_size,
     )
     support_patient_ids = support_data["patient_ids"]
+    preprocessing = fit_mimic_preprocessing(support_patient_ids, dataset_uid=f"mimic_dataset_{dataset_id}")
+    support_data = apply_mimic_preprocessing(support_data, preprocessing)
 
-    test_data_factuals, factual_attempts = make_valid_factual_test_data(
+    test_data_factuals = make_factual_test_data(
         rng=rng,
         support_patient_ids=support_patient_ids,
+        preprocessing=preprocessing,
     )
-    test_data, one_step_attempts = make_valid_one_step_test_data(
+    test_data = make_one_step_test_data(
         rng=rng,
         support_patient_ids=support_patient_ids,
+        preprocessing=preprocessing,
     )
-    test_data_seq, seq_attempts = make_valid_seq_test_data(
+    test_data_seq = make_sequence_test_data(
         rng=rng,
         support_patient_ids=support_patient_ids,
+        preprocessing=preprocessing,
     )
 
     scaling_data = get_scaling_params(support_data)
@@ -717,10 +717,8 @@ def make_dataset(dataset_id, gamma, support_size, rep, seed):
         "rep": int(rep),
         "domain": "mimic",
 
-        # Kept as a grouping stratum.
-        # MIMIC is real factual data; gamma does not change the data-generating process.
         "gamma": int(gamma),
-        "gamma_semantics": "pseudo_stratum_only_factual_mimic",
+        "gamma_semantics": "split_index",
 
         "seq_length": int(SEQ_LENGTH),
         "num_time_steps": int(SEQ_LENGTH),
@@ -756,10 +754,7 @@ def make_dataset(dataset_id, gamma, support_size, rep, seed):
         },
         "static_features_source": list(STATIC_LIST),
         "static_processed_columns_used": list(MIMIC["static_cols_used"]),
-
-        "test_factual_resample_attempts": int(factual_attempts),
-        "test_one_step_resample_attempts": int(one_step_attempts),
-        "test_seq_resample_attempts": int(seq_attempts),
+        "mimic_preprocessing": {"imputation_policy": preprocessing["imputation_policy"], "uses_backward_fill": False, "imputation_statistics_scope": "support_only", "imputation_source": "directly_observed_values", "static_normalization_scope": "support_only", "state_imputation_medians": preprocessing["state_imputation_medians"].tolist(), "static_continuous_columns": [MIMIC["static_cols_used"][i] for i in preprocessing["static_continuous_columns"]], "static_continuous_means": preprocessing["static_continuous_means"].tolist(), "static_continuous_stds": preprocessing["static_continuous_stds"].tolist(), "support_patient_ids": preprocessing["support_patient_ids"].tolist()},
 
         "support_data": support_data,
 
@@ -781,10 +776,8 @@ def make_dataset(dataset_id, gamma, support_size, rep, seed):
     )
 
 
-def generate(config: MIMICGeneratorConfig | None = None, **overrides: Any) -> pd.DataFrame:
-    config = config or MIMICGeneratorConfig()
-    if overrides:
-        config = MIMICGeneratorConfig.from_dict(dataclasses.asdict(config), **overrides)
+def generate(config: MIMICGeneratorConfig | None = None) -> pd.DataFrame:
+    config = MIMICGeneratorConfig() if config is None else config
 
     global INPUT_ROOT, MERGED_DATASET_SLUG, OUTPUT_DIR
     global GAMMAS, SUPPORT_SIZES, REPS_PER_CELL, TEST_BASE_PATIENTS, SEQ_LENGTH
@@ -805,12 +798,8 @@ def generate(config: MIMICGeneratorConfig | None = None, **overrides: Any) -> pd
     MIN_T_OBS = int(config.min_t_obs)
     BASE_SEED = int(config.base_seed)
 
-    output_dir = ensure_output_dir(OUTPUT_DIR)
+    output_dir = ensure_output_dir(OUTPUT_DIR, overwrite=bool(config.overwrite))
     MIMIC = load_mimic_arrays()
-    # ============================================================
-    # Generate datasets
-    # ============================================================
-
     summary_rows = []
     dataset_id = 0
 
@@ -839,6 +828,7 @@ def generate(config: MIMICGeneratorConfig | None = None, **overrides: Any) -> pd
 
                 file_path = output_dir / file_name
                 save_pickle(pickle_map, file_path)
+                write_dataset_manifest(pickle_map, file_path, generator_config=dataclasses.asdict(config), generator_source=__file__)
 
                 one_step_rows = pickle_map["test_data"]["states"].shape[0]
                 seq_rows = pickle_map["test_data_seq"]["states"].shape[0]
@@ -857,7 +847,7 @@ def generate(config: MIMICGeneratorConfig | None = None, **overrides: Any) -> pd
                     "domain": "mimic",
 
                     "gamma": gamma,
-                    "gamma_semantics": "pseudo_stratum_only_factual_mimic",
+                        "gamma_semantics": "split_index",
 
                     "support_size": support_size,
                     "training_size": support_size,
@@ -868,9 +858,6 @@ def generate(config: MIMICGeneratorConfig | None = None, **overrides: Any) -> pd
                     "test_data_rows_one_step_factual": one_step_rows,
                     "test_data_seq_rows_multi_step_factual": seq_rows,
 
-                    "test_factual_resample_attempts": pickle_map["test_factual_resample_attempts"],
-                    "test_one_step_resample_attempts": pickle_map["test_one_step_resample_attempts"],
-                    "test_seq_resample_attempts": pickle_map["test_seq_resample_attempts"],
 
                     "min_t_obs": MIN_T_OBS,
                     "seq_length": SEQ_LENGTH,

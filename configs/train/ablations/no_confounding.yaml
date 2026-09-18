@@ -1,0 +1,61 @@
+identity:
+  experiment_id: causal_long_pfn_paper_ablation_no_confounding_2500
+  model_variant: no_confounding
+  prior_variant: tscm_no_confounding
+runtime:
+  ckpt_input_dir: ''
+  output_dir: ./outputs/paper_runs/no_confounding/seed_42
+model:
+  D_OUTCOME: 1
+  D_STATIC_MAX: 5
+  N_ACTIONS: 4
+  D_MODEL: 256
+  N_HEADS: 8
+  N_HISTORY_LAYERS: 4
+  N_PFN_LAYERS: 4
+  D_FF: 1024
+  DROPOUT: 0.1
+  GMM_K: 5
+  GMM_PI_TEMP: 1.0
+  GMM_MIN_SIGMA: 0.02
+  GMM_MAX_SIGMA: 2.0
+training:
+  BATCH_SIZE: 16
+  ACCUM_STEPS: 16
+  TRAIN_NUM_WORKERS: 0
+  LR: 0.0003
+  WEIGHT_DECAY: 1.0e-05
+  WARMUP_STEPS: 100
+  MAX_STEPS: 2500
+  SCHED_TOTAL_STEPS: 2500
+  MIN_LR_SCALE: 0.02
+  CHECKPOINT_EVERY: 100
+  LOG_EVERY: 100
+  INFERENCE_MILESTONE_UPDATES:
+  - 500
+  - 1000
+  - 1500
+  - 2000
+  - 2500
+  SESSION_TIMEOUT: 999999
+  SEED: 42
+  DETERMINISTIC: false
+  ALLOW_TF32: true
+prior:
+  OBS_TIME_MIN: 1
+  OBS_TIME_MAX: 60
+  HORIZON_MIN: 1
+  HORIZON_MAX: 5
+  D_STATE_MIN: 1
+  D_STATE_MAX: 10
+  N_SUPPORT_MIN: 3
+  N_SUPPORT_MAX: 500
+  N_SUPPORT_ANCHORS: 4
+  OBSERVATIONAL_QUERY_PROB: 0.5
+  SUPPORT_FUTURE_COVARIATE_MASK_PROB: 0.35
+  ENABLE_MOTIFS: true
+  ENABLE_LATENT_HETEROGENEITY: true
+  ENABLE_EXPLICIT_DELAYED_TREATMENT_EFFECTS: true
+  ENABLE_CONFOUNDING: false
+stability:
+  CLIP_NORM: 1.0

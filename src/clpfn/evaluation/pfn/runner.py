@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import gc
+import hashlib
+import json
 import logging
 import os
 import time
@@ -12,8 +14,10 @@ import pandas as pd
 import torch
 from scipy.stats import spearmanr
 
+from clpfn.config.defaults import N_SUPPORT_ANCHORS
 from clpfn.evaluation.core import inputs as eval_inputs
 from clpfn.evaluation.core import outputs as eval_outputs
+from clpfn.evaluation.core import reporting
 from clpfn.evaluation.core.summaries import print_summary_table
 from clpfn.evaluation.pfn import calibration as cal
 from clpfn.evaluation.pfn.calibration_summaries import summarize_domain_calibration
@@ -22,17 +26,21 @@ from clpfn.evaluation.core import records as eval_records
 from clpfn.evaluation.core import tasks as eval_tasks
 from clpfn.evaluation.pfn.batches import (
     collate_ready_batch,
+    resolve_n_support_anchors,
     move_batch_to_device,
 )
 from clpfn.models.causal_long_pfn import (
-    load_causal_long_pfn_checkpoint,
     predictive_mean_from_gmm,
+)
+from clpfn.training.checkpointing import (
+    load_causal_long_pfn_checkpoint,
+    resolve_checkpoint_path,
 )
 
 LOGGER = logging.getLogger(__name__)
 
 
-READY_FORMAT_VERSION = "causal_long_pfn_ready"
+READY_FORMAT_VERSION = "causal_long_pfn_ready_static_normalized"
 
 PFN_BATCH_SIZE = 32
 WANTED_DOMAINS = common.WANTED_DOMAINS
@@ -152,15 +160,23 @@ def _model_sigma_to_eval_norm(sigma, support_context: dict[str, Any]):
     return sigma * (model_std / eval_std)
 
 
+def _file_sha256(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _output_task_name(task_name: str) -> str:
+    return "one_step_exhaustive" if "one_step" in task_name else "sequential_rollout"
+
+
 def find_pfn_checkpoint(checkpoint_path: str | Path | None) -> str:
     if checkpoint_path is None:
         raise ValueError("Provide a checkpoint path.")
 
-    checkpoint = Path(checkpoint_path)
-    if not checkpoint.exists():
-        raise FileNotFoundError(f"Checkpoint path not found: {checkpoint}")
-
-    return str(checkpoint)
+    return str(resolve_checkpoint_path(checkpoint_path))
 
 
 @torch.no_grad()
@@ -168,53 +184,76 @@ def evaluate_ready_task(
     model,
     device,
     ready_map,
+    ckpt_diag: dict[str, Any],
     task_name: str,
     run_id: str,
     batch_size: int = PFN_BATCH_SIZE,
     report_calibration: bool = True,
-) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
+    evaluation_id: str | None = None,
+    evaluation_config_hash: str | None = None,
+    n_support_anchors: int | None = None,
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     task = ready_map["tasks"][task_name]
     support_context = ready_map["support_context"]
+
+    n_anchors_used = resolve_n_support_anchors(n_support_anchors)
 
     n_eval = eval_tasks.ready_task_n_eval(task)
 
     if n_eval <= 0:
-        return _metrics_from_arrays([], []), [], []
+        return _metrics_from_arrays([], []), [], [], [], []
 
     preds_norm = []
     targets_norm = []
     prediction_rows = []
-    calibration_rows = []
+    rollout_rows = []
+    gmm_rows = []
 
     support_size = int(ready_map["support_size"])
     rows_all = eval_tasks.ready_task_row_ids(task)
+    hardware_fields = reporting.hardware_report_fields(device)
+    checkpoint_fields = reporting.pfn_checkpoint_fields(ckpt_diag)
+    tuning_fields = reporting.no_tuning_fields()
 
     for start in range(0, n_eval, batch_size):
         end = min(start + batch_size, n_eval)
-        batch = collate_ready_batch(ready_map, task_name, start, end)
+        batch = collate_ready_batch(ready_map, task_name, start, end, n_support_anchors=n_anchors_used)
         current_batch_size = end - start
 
         batch = move_batch_to_device(batch, device)
 
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        started = time.perf_counter()
         with torch.amp.autocast("cuda", enabled=torch.cuda.is_available()):
-            log_pi, mu, sigma = model.rollout(batch)
+            log_pi, mu, sigma, trace = model.rollout(
+                batch,
+                return_trace=True,
+                rollout_mode="mean",
+                feedback_clip=common.OUTCOME_CLIP_TRAIN,
+            )
             pred_norm = predictive_mean_from_gmm(log_pi, mu)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        predict_time_sec = float((time.perf_counter() - started) / max(1, current_batch_size))
 
         pn_model_unclipped = pred_norm.detach().float().cpu().numpy()
-        pn_unclipped = _model_to_eval_norm(pn_model_unclipped, support_context)
-        pn = np.clip(
-            pn_unclipped,
-            -common.PRED_CLIP_REPORT,
-            common.PRED_CLIP_REPORT,
-        )
-        tn_model = batch["oracle_Y_final"].detach().float().cpu().numpy()
-        tn = batch.get("target_eval_norm", batch["oracle_Y_final"]).detach().float().cpu().numpy()
+        pn = _model_to_eval_norm(pn_model_unclipped, support_context)
+        tn = batch["target_eval_norm"].detach().float().cpu().numpy()
 
         t_obs_np = batch["t_obs"].detach().cpu().numpy().astype(np.int64)
         t_target_np = batch["t_target"].detach().cpu().numpy().astype(np.int64)
         tau_np = batch["tau"].detach().cpu().numpy().astype(np.int64)
 
         row_ids = rows_all[start:end]
+        trace_log_pi = trace["log_pi"].detach().float().cpu().numpy()
+        trace_mu = trace["mu"].detach().float().cpu().numpy()
+        trace_sigma = trace["sigma"].detach().float().cpu().numpy()
+        trace_mean = trace["mixture_mean"].detach().float().cpu().numpy()
+        trace_var = trace["mixture_variance"].detach().float().cpu().numpy()
+        trace_feedback = trace["feedback_outcome"].detach().float().cpu().numpy()
+        n_trace_steps = int(trace_mean.shape[1])
+        output_task_name = _output_task_name(task_name)
 
         one_step_mask = np.asarray(
             [eval_tasks.is_one_step_task(task_name, tau_np[i]) for i in range(current_batch_size)],
@@ -241,46 +280,90 @@ def evaluate_ready_task(
         targets_norm.extend(tn.tolist())
 
         for batch_idx in range(current_batch_size):
-            row = eval_records.make_ready_prediction_record(
-                method_name="causal_long_pfn",
-                method_family="PFN",
-                ready_map={**ready_map, "support_size": support_size},
-                task_name=task_name,
-                run_id=run_id,
-                row_id=row_ids[batch_idx],
-                query_id=start + batch_idx,
-                pred_norm=pn[batch_idx],
-                target_norm=tn[batch_idx],
-                t_obs=t_obs_np[batch_idx],
-                tau=tau_np[batch_idx],
-                t_target=t_target_np[batch_idx],
-                extra_fields={
-                    "pred_norm_unclipped": float(pn_unclipped[batch_idx]),
-                    "pred_model_norm_unclipped": float(pn_model_unclipped[batch_idx]),
-                    "target_model_norm": float(tn_model[batch_idx]),
-                    "pred_clip_report": float(common.PRED_CLIP_REPORT),
-                },
-            )
-
-            if report_calibration:
-                row = cal.add_empty_calibration_fields(row)
-
-                if one_step_mask[batch_idx] and calibration is not None:
-                    row = cal.add_calibration_fields(row, batch_idx, calibration)
-                    calibration_rows.append(row.copy())
-
-            prediction_rows.append(row)
+            global_idx = start + batch_idx
+            plan = np.asarray(task["planned_action_sequence"][global_idx], dtype=np.int64)
+            horizons = range(1, n_trace_steps + 1) if output_task_name == "sequential_rollout" else range(1, 2)
+            for horizon in horizons:
+                step_idx = horizon - 1
+                pred_model_unclipped = float(trace_mean[batch_idx, step_idx])
+                pred_eval_unclipped = float(_model_to_eval_norm(np.asarray([pred_model_unclipped]), support_context)[0])
+                if horizon == int(tau_np[batch_idx]) and pred_eval_unclipped != float(pn[batch_idx]):
+                    raise RuntimeError("Stored PFN rollout endpoint differs from the existing final evaluation prediction.")
+                if output_task_name == "sequential_rollout":
+                    target_raw = float(task["target_path_raw"][global_idx, step_idx])
+                    target_model = float(task["target_path_model_norm"][global_idx, step_idx])
+                    target_eval_unclipped = float(task["target_path_eval_norm_unclipped"][global_idx, step_idx])
+                    target_eval_reported = float(task["target_path_eval_norm_reported"][global_idx, step_idx])
+                else:
+                    target_raw = float(task["target_raw"][global_idx])
+                    target_model = float(task["target_model_norm"][global_idx])
+                    target_eval_unclipped = float((target_raw - support_context["eval_out_mean"]) / max(float(support_context["eval_out_std"]), 1e-6))
+                    target_eval_reported = float(task["target_eval_norm"][global_idx])
+                target_time = int(t_obs_np[batch_idx] + horizon)
+                current_y_raw = float(task["current_y_raw"][global_idx])
+                current_y_model = float(task["current_y_model_norm"][global_idx])
+                current_y_eval_unclipped = float(task["current_y_eval_norm_unclipped"][global_idx])
+                pred_raw_unclipped = float(pred_model_unclipped * float(support_context["out_std"]) + float(support_context["out_mean"]))
+                common_fields = {
+                    "evaluation_id": evaluation_id or run_id,
+                    "dataset_uid": str(ready_map["dataset_uid"]),
+                    "patient_id": int(task["patient_id"][global_idx]), "patient_uid": str(task["patient_uid"][global_idx]), "origin_uid": str(task["origin_uid"][global_idx]),
+                    "plan_uid": str(task["plan_uid"][global_idx]), "query_uid": str(task["query_uid"][global_idx]),
+                    "planned_action_sequence": json.dumps(plan.tolist()),
+                    "action_at_rollout_step": int(plan[step_idx]) if step_idx < len(plan) else None,
+                    "prediction_raw": pred_raw_unclipped, "prediction_raw_unclipped": pred_raw_unclipped,
+                    "prediction_model_norm": pred_model_unclipped, "prediction_model_norm_unclipped": pred_model_unclipped,
+                    "prediction_eval_norm_unclipped": pred_eval_unclipped, "prediction_eval_norm": pred_eval_unclipped,
+                    "current_y_raw": current_y_raw, "current_y_model_norm": current_y_model,
+                    "current_y_eval_norm_unclipped": current_y_eval_unclipped, "target_raw": target_raw,
+                    "target_model_norm": target_model, "target_eval_norm_unclipped": target_eval_unclipped,
+                    "target_eval_norm": target_eval_reported, "squared_error": float((pred_eval_unclipped - target_eval_reported) ** 2),
+                    "absolute_error": float(abs(pred_eval_unclipped - target_eval_reported)),
+                    "rollout_mode": "mean",
+                    "schema_version": 1, "evaluation_config_hash": evaluation_config_hash or "",
+                    "pfn_checkpoint_id": ckpt_diag["checkpoint_basename"], "pfn_checkpoint_hash": ckpt_diag["checkpoint_file_sha256"],
+                    "pretraining_seed": ckpt_diag["pretraining_seed"], "model_variant": ckpt_diag["model_variant"], "prior_variant": ckpt_diag["prior_variant"],
+                    "evaluation_seed": int(common.SEED), "fit_id": "", "number_rollout_steps": n_trace_steps,
+                    "batch_size": current_batch_size, "support_size": support_size, "n_support_anchors": int(n_anchors_used),
+                    "n_pfn_layers_used": int(model.n_pfn_layers),
+                    "raw_dataset_hash": ready_map["_raw_file_hash"], "ready_dataset_hash": ready_map["_ready_file_hash"],
+                    "peak_batch_gpu_memory": int(torch.cuda.max_memory_allocated()) if torch.cuda.is_available() else 0,
+                }
+                rollout_rows.append({"method": "causal_long_pfn", "method_family": "PFN", "task_name": output_task_name, "reported_task": reporting.reported_task(output_task_name, horizon), "horizon": horizon, "observation_time": int(t_obs_np[batch_idx]), "target_time": target_time, **common_fields})
+                for component_idx in range(trace_mu.shape[-1]):
+                    gmm_rows.append({"evaluation_id": evaluation_id or run_id, "dataset_uid": str(ready_map["dataset_uid"]), "query_uid": str(task["query_uid"][global_idx]), "task_name": output_task_name, "horizon": horizon, "component_index": component_idx, "mixture_weight": float(np.exp(trace_log_pi[batch_idx, step_idx, component_idx])), "component_mean": float(trace_mu[batch_idx, step_idx, component_idx]), "component_std": float(trace_sigma[batch_idx, step_idx, component_idx]), "mixture_mean": pred_model_unclipped, "mixture_variance": float(trace_var[batch_idx, step_idx]), "feedback_outcome": float(trace_feedback[batch_idx, step_idx]), "conditional_path": "deterministic_self_fed_mean", "schema_version": 1})
+                row = eval_records.make_ready_prediction_record(method_name="causal_long_pfn", method_family="PFN", ready_map={**ready_map, "support_size": support_size}, task_name=output_task_name, run_id=run_id, row_id=row_ids[batch_idx], query_id=global_idx, pred_norm=pred_eval_unclipped, target_norm=target_eval_reported, t_obs=t_obs_np[batch_idx], tau=horizon, t_target=target_time, predict_time_sec=predict_time_sec / max(n_trace_steps, 1), extra_fields=common_fields)
+                if report_calibration:
+                    row = cal.add_empty_calibration_fields(row)
+                    if output_task_name == "one_step_exhaustive" and calibration is not None:
+                        row = cal.add_calibration_fields(row, batch_idx, calibration)
+                row.update(reporting.task_identity_fields(ready_map, output_task_name, horizon))
+                row.update(tuning_fields)
+                row.update(checkpoint_fields)
+                row.update(hardware_fields)
+                prediction_rows.append(row)
 
         del batch, log_pi, mu, sigma, pred_norm
 
     metrics = _metrics_from_arrays(preds_norm, targets_norm)
-    return metrics, prediction_rows, calibration_rows
+    reporting.finalize_task_timing(prediction_rows, refit_time_sec=0.0)
+    calibration_rows = [
+        row.copy()
+        for row in prediction_rows
+        if bool(row.get("calibration_available", False))
+    ]
+    return metrics, prediction_rows, calibration_rows, rollout_rows, gmm_rows
 
 
 def _prepare_ready_map(ready_file: str | Path) -> dict[str, Any]:
     ready_map = eval_inputs.load_pickle(ready_file)
     ready_map["_ready_file_basename"] = os.path.basename(str(ready_file))
     ready_map["_ready_file_path"] = str(ready_file)
+    ready_map["_ready_file_hash"] = _file_sha256(ready_file)
+    source = Path(str(ready_map["source_file"]))
+    if not source.is_file():
+        raise FileNotFoundError(f"Ready dataset source file not found: {source}")
+    ready_map["_raw_file_hash"] = _file_sha256(source)
     return ready_map
 
 
@@ -296,6 +379,8 @@ def evaluate_ready_files(
     batch_size: int = PFN_BATCH_SIZE,
     wanted_domains=WANTED_DOMAINS,
     report_calibration: bool = True,
+    evaluation_config_hash: str = "",
+    n_support_anchors: int | None = None,
 ) -> dict[str, Any]:
     LOGGER.info(
         "Starting CausalLongPFN evaluation | checkpoint=%s | sha256_prefix=%s | "
@@ -309,9 +394,10 @@ def evaluate_ready_files(
     )
     LOGGER.debug("CUDA at evaluation start: %s", _cuda_mem_string())
 
+    n_anchors_used = resolve_n_support_anchors(n_support_anchors)
+
     model.eval()
 
-    prediction_rows = []
     calibration_rows = []
     skipped: list[dict[str, Any]] = []
     n_files_used = 0
@@ -342,15 +428,15 @@ def evaluate_ready_files(
         global_dataset_id = int(ready_map["global_dataset_id"])
         dataset_id = int(ready_map["dataset_id"])
 
-        n_ctx = int(support_context["n_support"])
+        support_count = int(support_context["n_support"])
         d_input = int(support_context["d_input"])
 
         LOGGER.info(
-            "domain=%s | global_dataset_id=%s | dataset_id=%s | n_ctx=%s | d_input=%s | tasks=%s",
+            "domain=%s | global_dataset_id=%s | dataset_id=%s | support=%s | d_input=%s | tasks=%s",
             domain,
             global_dataset_id,
             dataset_id,
-            n_ctx,
+            support_count,
             d_input,
             eval_tasks.ready_task_names(ready_map),
         )
@@ -361,6 +447,10 @@ def evaluate_ready_files(
 
             if n_eval <= 0:
                 LOGGER.info("task=%s skipped: n_eval=%s", task_name, n_eval)
+                continue
+            output_task_name = _output_task_name(task_name)
+            if eval_outputs.partition_is_complete(output_paths, evaluation_id=run_id, method="causal_long_pfn", dataset_uid=str(ready_map["dataset_uid"]), task_name=output_task_name):
+                LOGGER.info("task=%s skipped: completed partition exists", task_name)
                 continue
 
             t_obs_arr = np.asarray(task["t_obs"])
@@ -378,18 +468,33 @@ def evaluate_ready_files(
                 sorted(np.unique(tau_arr).tolist()) if tau_arr.size else [],
             )
 
-            metrics, pred_records, cal_records = evaluate_ready_task(
+            metrics, pred_records, cal_records, rollout_records, gmm_records = evaluate_ready_task(
                 model=model,
                 device=device,
                 ready_map=ready_map,
+                ckpt_diag=ckpt_diag,
                 task_name=task_name,
                 run_id=run_id,
                 batch_size=batch_size,
                 report_calibration=bool(report_calibration),
+                evaluation_id=run_id,
+                evaluation_config_hash=evaluation_config_hash,
+                n_support_anchors=n_anchors_used,
             )
-
-            prediction_rows.extend(pred_records)
             calibration_rows.extend(cal_records)
+            expected_rows = n_eval * (1 if output_task_name == "one_step_exhaustive" else int(common.PROJECTION_HORIZON))
+            if len(pred_records) != expected_rows or len(rollout_records) != expected_rows:
+                raise RuntimeError(f"Unexpected PFN rollout row count for {task_name}: expected {expected_rows}, got predictions={len(pred_records)}, rollout={len(rollout_records)}.")
+            eval_outputs.write_completed_partition(
+                output_paths,
+                evaluation_id=run_id,
+                method="causal_long_pfn",
+                dataset_uid=str(ready_map["dataset_uid"]),
+                task_name=output_task_name,
+                rollout_steps=pd.DataFrame(rollout_records),
+                prediction_rows=pd.DataFrame(pred_records),
+                gmm_components=pd.DataFrame(gmm_records),
+            )
 
             LOGGER.info(
                 "metrics | normRMSE=%.6f | normMAE=%.6f | pred_norm_mean=%.6f | pred_norm_std=%.6f",
@@ -407,14 +512,13 @@ def evaluate_ready_files(
 
         LOGGER.debug("CUDA after file: %s", _cuda_mem_string())
 
-    if len(prediction_rows) == 0:
+    prediction_df = eval_outputs.collect_completed_partitions(output_paths, "prediction_rows.parquet", evaluation_id=run_id)
+    if prediction_df.empty:
         raise RuntimeError("No evaluation rows were produced. Check ready files, domains, and n_eval values.")
-
-    prediction_df = pd.DataFrame(prediction_rows)
     summaries = eval_outputs.write_prediction_summaries(prediction_df, paths=output_paths)
     calibration_df = pd.DataFrame()
     if report_calibration:
-        calibration_rows_df = pd.DataFrame(calibration_rows)
+        calibration_rows_df = prediction_df
         calibration_df, calibration_outputs = _write_calibration_summary(
             calibration_rows_df,
             prediction_df,
@@ -435,16 +539,15 @@ def evaluate_ready_files(
         "n_skipped": int(len(skipped)),
         "skipped": skipped,
         "checkpoint": ckpt_diag,
+        "evaluation_id": run_id,
+        "evaluation_config_hash": evaluation_config_hash,
         "report_calibration": bool(report_calibration),
         "metric": "normalized_rmse",
         "metric_definition": (
-            "RMSE(pred_norm_report_clipped_to_[-20,20] - "
-            "clip((target_raw - eval_out_mean) / eval_out_std, -10, 10))"
+            "RMSE(pred_eval_norm - target_eval_norm), both on the shared "
+            "support-only evaluation normalization"
         ),
-        "target_norm_clipped_to_match": True,
-        "target_norm_clip": float(common.TARGET_NORM_CLIP),
-        "pred_norm_clipped_for_report": True,
-        "pred_clip_report": float(common.PRED_CLIP_REPORT),
+        "feedback_clip": float(common.OUTCOME_CLIP_TRAIN),
         "elapsed_min": float(elapsed / 60.0),
     })
 
@@ -476,6 +579,7 @@ def run_all(
     wanted_domains=WANTED_DOMAINS,
     output_dir=None,
     report_calibration: bool = True,
+    evaluation_id: str | None = None,
 ) -> dict[str, Any]:
     output_paths = eval_outputs.prepare_output_paths(output_dir or DEFAULT_OUTPUT_DIR)
     common.configure_torch_runtime(seed=common.SEED)
@@ -518,23 +622,41 @@ def run_all(
     model, ckpt_diag = load_causal_long_pfn_checkpoint(
         path=ckpt_path,
         device=device,
-        strict=True,
     )
+    ckpt_diag["checkpoint_file_sha256"] = _file_sha256(ckpt_path)
+    checkpoint_n_support_anchors = int(ckpt_diag["prior_config"]["N_SUPPORT_ANCHORS"])
+    if not 1 <= checkpoint_n_support_anchors <= int(N_SUPPORT_ANCHORS):
+        raise ValueError(
+            f"Checkpoint support-anchor count {checkpoint_n_support_anchors} is outside "
+            f"[1, {int(N_SUPPORT_ANCHORS)}]; ready files were built with "
+            f"{int(N_SUPPORT_ANCHORS)} anchors per support trajectory."
+        )
+    if checkpoint_n_support_anchors != int(N_SUPPORT_ANCHORS):
+        LOGGER.info(
+            "Checkpoint uses %s support anchor(s); reading the leading slice of the "
+            "%s built anchors.",
+            checkpoint_n_support_anchors,
+            int(N_SUPPORT_ANCHORS),
+        )
 
-    run_id = f"causal_long_pfn_{ckpt_diag['checkpoint_basename'].replace('.pt', '')}_{int(time.time())}"
+    evaluation_config_hash = hashlib.sha256(json.dumps({
+        "checkpoint": ckpt_diag["checkpoint_file_sha256"], "batch_size": int(batch_size),
+        "wanted_domains": list(wanted_domains), "rollout_mode": "mean",
+        "n_support_anchors": checkpoint_n_support_anchors,
+        "n_pfn_layers_used": int(model.n_pfn_layers),
+        "ready_files": {str(Path(path).resolve()): _file_sha256(path) for path in ready_files},
+    }, sort_keys=True).encode("utf-8")).hexdigest()
+    run_id = evaluation_id or f"causal_long_pfn_{ckpt_diag['checkpoint_file_sha256'][:16]}_{evaluation_config_hash[:12]}"
 
     LOGGER.info("Run ID: %s", run_id)
     LOGGER.info(
         "Checkpoint loaded | basename=%s | sha256_prefix=%s",
-        ckpt_diag.get("checkpoint_basename", ""),
-        ckpt_diag.get("checkpoint_file_sha256_prefix", ""),
+        ckpt_diag["checkpoint_basename"],
+        ckpt_diag["checkpoint_file_sha256_prefix"],
     )
 
     for key, value in ckpt_diag.items():
-        if key in {"missing_keys", "unexpected_keys"}:
-            LOGGER.debug("  %s: %s", key, len(value))
-        else:
-            LOGGER.debug("  %s: %s", key, value)
+        LOGGER.debug("  %s: %s", key, value)
 
     if torch.cuda.is_available():
         LOGGER.debug("CUDA after model load: %s", _cuda_mem_string())
@@ -549,4 +671,6 @@ def run_all(
         batch_size=batch_size,
         wanted_domains=tuple(wanted_domains),
         report_calibration=bool(report_calibration),
+        evaluation_config_hash=evaluation_config_hash,
+        n_support_anchors=checkpoint_n_support_anchors,
     )

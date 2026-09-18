@@ -11,9 +11,6 @@ CT_EVAL_BATCH_SIZE = 1
 DEFAULT_HPARAMS = {}
 CT_SPACE = {}
 
-TUNING_CACHE = {}
-
-
 def apply_config(config):
     global MAX_VAL_ORIGINS, CT_EVAL_BATCH_SIZE
 
@@ -23,4 +20,3 @@ def apply_config(config):
     CT_EVAL_BATCH_SIZE = int(limits["eval_batch_size"])
     replace_mapping(DEFAULT_HPARAMS, config["default_hparams"])
     replace_mapping(CT_SPACE, config["search_space"])
-    TUNING_CACHE.clear()
