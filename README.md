@@ -49,8 +49,7 @@ Amirhossein Zare, Amirhessam Zare, Herlock Rahimi, Reza Salarikia, Mohammad Kash
 
 This repository contains code for:
 
-- synthetic CausalLongPFN pretraining from a temporal structural causal model
-  prior;
+- synthetic CausalLongPFN pretraining and matched pretraining ablations from a temporal structural causal model prior;
 - benchmark generation for cancer, HIV, warfarin, and MIMIC-III-style ICU
   treatment-response tasks;
 - conversion of benchmark files into CausalLongPFN-ready support/query datasets;
@@ -82,36 +81,6 @@ src/clpfn/
   evaluation/               PFN and baseline evaluation pipeline
   baselines/                MSM, RMSN, G-Net, and CT adapters
 ```
-
-## Pretraining ablations
-
-`configs/train/ablations/` holds seven single-mechanism ablations of the
-pretraining prior. Prior-mechanism ablations change what the sampled temporal
-structural causal model contains:
-
-- `no_motifs`
-- `no_latent_heterogeneity`
-- `no_confounding`
-- `immediate_effects_only`
-
-Supervision-mixture ablations change how the query target is constructed rather
-than what the sampled model contains. The canonical prior draws a factual query
-with probability 0.50 and an interventional structural-replay query otherwise;
-these two variants pin that mixture to its endpoints:
-
-- `factual_pretraining_only` (`OBSERVATIONAL_QUERY_PROB = 1.0`): the model never
-  sees a counterfactual target during pretraining.
-- `counterfactual_pretraining_only` (`OBSERVATIONAL_QUERY_PROB = 0.0`): every
-  query target is an interventional structural replay.
-
-In-context interface ablation:
-
-- `single_anchor_support` (`N_SUPPORT_ANCHORS = 1`): one labeled support anchor
-  per support trajectory instead of the canonical four.
-
-Each ablation changes one pretraining mechanism while retaining the model
-architecture. The 2,500-step `canonical_reference` configuration is the matched
-comparator for all seven.
 
 ## Installation
 
@@ -317,8 +286,8 @@ Most behavior is controlled through YAML files:
 
 - `configs/data/all_benchmarks.yaml` sets domains, support sizes, repetitions,
   sequence length, prediction horizon, and output directories.
-- `configs/train/causal_long_pfn.yaml` sets model size, optimizer parameters,
-  synthetic-prior ranges, checkpoint cadence, and runtime output directories.
+- `configs/train/causal_long_pfn.yaml` sets the main pretraining configuration;
+  matched ablation configs are under `configs/train/ablations/`.
 - `configs/eval/pfn.yaml` sets PFN-ready input directories, checkpoint path,
   batch size, calibration reporting, and output directory.
 - `configs/eval/*.yaml` set baseline-specific hyperparameter search spaces,
