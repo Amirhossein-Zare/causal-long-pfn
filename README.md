@@ -15,12 +15,13 @@ longitudinal treatment-response data** and **zero-shot in-context
 counterfactual outcome prediction**. The project studies history-conditional
 potential-outcome prediction from longitudinal treatment-response time series:
 given support trajectories from a new domain, a query history, and a planned
-future treatment sequence, a frozen CausalLongPFN model predicts a distribution
-over future outcomes without target-domain gradient updates, propensity-model
-fitting, or adversarial balancing. The model is pretrained on synthetic temporal
-structural causal models (TSCMs) and evaluated on branchable cancer, HIV, and
-warfarin counterfactual benchmarks, as well as factual MIMIC-III ICU
-rolling-origin prediction.
+future treatment sequence, a frozen CausalLongPFN model predicts a one-step
+outcome distribution and recursively rolls out its mean under the planned
+treatments, without target-domain gradient updates, propensity-model fitting, or
+adversarial balancing. The model is pretrained on synthetic temporal structural
+causal models (TSCMs) and evaluated on branchable cancer, HIV, and warfarin
+counterfactual benchmarks, as well as factual MIMIC-III ICU rolling-origin
+prediction.
 
 ## Paper
 
@@ -117,7 +118,8 @@ the package can be imported without a GPU.
 
 ## Pretrained weights
 
-Pretrained inference-only weights are available on Hugging Face:
+The seed-42 checkpoint, pretrained for 10,000 optimizer updates, is available
+on Hugging Face as inference-only weights:
 
 <https://huggingface.co/Amirhossein-Zare/causal-long-pfn>
 
@@ -126,11 +128,11 @@ pip install safetensors huggingface_hub
 ```
 
 ```python
-from huggingface_hub import hf_hub_download
+from huggingface_hub import snapshot_download
 
-weights_path = hf_hub_download(
+snapshot_download(
     repo_id="Amirhossein-Zare/causal-long-pfn",
-    filename="causal-long-pfn-seed42-step10000.safetensors",
+    local_dir="weights",
 )
 ```
 
@@ -138,7 +140,6 @@ weights_path = hf_hub_download(
 directory holding the downloaded release:
 
 ```bash
-huggingface-cli download Amirhossein-Zare/causal-long-pfn --local-dir weights
 clpfn-eval --method pfn --config configs/eval/pfn.yaml --checkpoint weights
 ```
 
@@ -173,8 +174,8 @@ outputs/benchmarks/mimic
 clpfn-train --config configs/train/causal_long_pfn.yaml
 ```
 
-The default training config uses synthetic TSCM episodes generated on the fly.
-Checkpoints are written to:
+The default training config uses synthetic TSCM episodes generated on the fly
+for 10,000 updates with seed `42`. Checkpoints are written to:
 
 ```text
 outputs/paper_runs/causal_long_pfn/seed_42
@@ -230,6 +231,9 @@ prediction_rows.parquet
 domain_task_normalized_rmse.csv
   Mean and standard deviation of normalized RMSE by domain, task, and method.
 
+sequential_horizon_normalized_rmse.csv
+  Normalized RMSE across rollout horizons 1–5.
+
 calibration_summary_domain.csv
   One-step probabilistic calibration summary by domain, when enabled.
 
@@ -248,16 +252,18 @@ clpfn-eval --method msm --config configs/eval/msm.yaml --mode tune
 clpfn-eval --method msm --config configs/eval/msm.yaml --mode evaluate
 ```
 
-The same two-step form applies to `rmsn`, `gnet`, and `ct`. The two reference
-baselines need no tuning and run in a single step:
+The same two-step form applies to `rmsn`, `gnet`, and `ct`. MSM uses a fixed
+prespecified configuration; its tuning step records the manifest. The two
+reference baselines need no tuning and run in a single step:
 
 ```bash
 clpfn-eval --method persistence           --config configs/eval/persistence.yaml
 clpfn-eval --method linear_autoregressive --config configs/eval/linear_autoregressive.yaml
 ```
 
-Baselines are trained and selected on the target support data according to their
-configuration. CausalLongPFN is evaluated frozen, using the support trajectories
+RMSN, G-Net, and CT are selected using support-only validation and refit on the
+full support set. MSM and Linear AR are fit on the support data; Persistence
+requires no fitting. CausalLongPFN remains frozen, using support trajectories
 only as in-context input.
 
 ## Benchmarks
@@ -287,7 +293,8 @@ Most behavior is controlled through YAML files:
 - `configs/data/all_benchmarks.yaml` sets domains, support sizes, repetitions,
   sequence length, prediction horizon, and output directories.
 - `configs/train/causal_long_pfn.yaml` sets the main pretraining configuration;
-  matched ablation configs are under `configs/train/ablations/`.
+  matched 2,500-update ablation configs are under `configs/train/ablations/`,
+  with the non-ablated reference in `configs/train/canonical_reference.yaml`.
 - `configs/eval/pfn.yaml` sets PFN-ready input directories, checkpoint path,
   batch size, calibration reporting, and output directory.
 - `configs/eval/*.yaml` set baseline-specific hyperparameter search spaces,
@@ -299,13 +306,18 @@ sequence length `60`, and horizon `5`, giving 25 datasets per domain.
 
 ## Reported results
 
-In the paper, a single frozen CausalLongPFN model is compared with baselines that
-are trained and selected separately for each target domain. The reported model
-achieves the best domain-balanced one-step normalized RMSE and the third-best
-domain-balanced five-step normalized RMSE. It also ranks first on factual
-MIMIC-III rolling-origin prediction at both horizons, where evaluation is under
-observed future treatment paths rather than unobserved counterfactual
-interventions.
+The paper reports results averaged across three pretraining seeds (`42, 43, 44`),
+with each model frozen during evaluation. Across cancer, HIV, and warfarin, CausalLongPFN
+has the lowest one-step counterfactual macro-average normalized RMSE (`0.067`)
+and remains competitive at five steps (`0.288`), where RMSN has the lowest
+mean error. On factual MIMIC-III prediction, none of the four fitted causal
+baselines differs significantly from CausalLongPFN at either horizon after Holm
+correction; CausalLongPFN outperforms both predictive references at one step.
+
+These results support synthetic pretraining as a way to transfer across
+longitudinal tasks without target-domain fitting. Matched ablations highlight
+the complementary roles of mixed factual/interventional queries and multiple
+labeled support anchors.
 
 For exact numbers and experimental details, see the paper.
 
@@ -319,15 +331,16 @@ Counterfactual interpretation still requires, among other conditions,
 consistency, positivity, sequential exchangeability given the measured history,
 adequate treatment overlap, and well-defined interventions.
 
-Performance also depends on support from the synthetic TSCM prior.
-Predictions may be unreliable when the target domain contains mechanisms,
-missingness patterns, treatment policies, outcome dynamics, or intervention
-effects that are poorly represented by the pretraining prior. The current
-implementation focuses on discrete treatments, fixed time grids, and
-deterministic mean rollout.
+Transfer depends on coverage of the synthetic TSCM prior; predictions may be
+unreliable for poorly represented mechanisms, treatment policies, or data
+patterns. The current implementation uses discrete treatments, fixed time grids,
+and deterministic mean rollout, which does not propagate full trajectory
+uncertainty. These are implementation choices, not fundamental restrictions of
+the framework. Predictive intervals require domain-specific calibration checks.
 
 MIMIC-III results should be interpreted as factual rolling-origin prediction
 under observed clinical practice, not as validation of individual counterfactual
 treatment effects under unobserved ICU interventions.
 
-This repository is not intended for clinical decision-making.
+CausalLongPFN is intended for research and hypothesis generation, not as a
+standalone clinical decision system.
